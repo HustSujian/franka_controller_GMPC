@@ -1,637 +1,999 @@
-#include <serl_franka_controllers/gmpc_dual_layer.h>
+// gmpc_dual_layer.cpp
+// Dual-layer GMPC (Primary tracking + Secondary nullspace/smoothness) for 7-DoF torque control.
+// - Primary QP: tracking in error-state y=[phi; V] with constraints
+// - Secondary QP: within deviation box around primary solution, optimize smoothness + nullspace preference
+//
+// This implementation is adapted from the uploaded MATLAB "7dof-双层.txt":
+//   - solvePrimaryMPC() + buildPrimaryConstraints() + buildPrimaryCost()
+//   - solveSecondaryMPC_Modified() + deviation constraints + smooth + N'RnullN
+//
+// And follows OsqpEigen usage patterns similar to uploaded Jacobian.cpp.
+//
+// NOTE (Franka practical):
+// - Franka provides mass matrix M(q), coriolis vector c(q,dq), gravity g(q) via model handle.
+// - Coriolis *matrix* C(q,dq) is not available; Jdot is not directly available either.
+// - We therefore use an affine Vdot model:
+//     Vdot = J * M^{-1} * u  +  (Jdot*dq - J*M^{-1}(coriolis+gravity))
+//   and estimate Jdot via finite difference.
 
+#include <OsqpEigen/OsqpEigen.h>
+
+#include <Eigen/Core>
+#include <Eigen/Dense>
+#include <Eigen/Geometry>
+#include <Eigen/Sparse>
+
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <limits>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include <unsupported/Eigen/MatrixFunctions>
 
 namespace serl_franka_controllers {
 
-GMPCDualLayer::GMPCDualLayer() {}
+// ------------------------------ Utilities ------------------------------
 
-void GMPCDualLayer::reset() {
-  solver_initialized_ = false;
-  lower_initialized_  = false;
-  primal_last_.resize(0);
-  dual_last_.resize(0);
-  u_prev_cycle_.setZero();
+static inline Eigen::Matrix3d skew3(const Eigen::Vector3d& a) {
+  Eigen::Matrix3d A;
+  A << 0.0, -a.z(), a.y(),
+       a.z(), 0.0, -a.x(),
+      -a.y(), a.x(), 0.0;
+  return A;
 }
 
-void GMPCDualLayer::setParams(const GMPCParams& p) {
-  p_ = p;
+// Lie algebra adjoint operator ad_V for a twist V = [w; v] in R^6
+// ad_V = [ [w^, 0],
+//          [v^, w^] ]
+static inline Eigen::Matrix<double, 6, 6> ad6(const Eigen::Matrix<double, 6, 1>& V) {
+  const Eigen::Vector3d w = V.template head<3>();
+  const Eigen::Vector3d v = V.template tail<3>();
+  Eigen::Matrix<double, 6, 6> ad;
+  ad.setZero();
+  ad.block<3,3>(0,0) = skew3(w);
+  ad.block<3,3>(3,0) = skew3(v);
+  ad.block<3,3>(3,3) = skew3(w);
+  return ad;
 }
 
-bool GMPCDualLayer::initSolver() {
-  const int Nx = p_.Nx;
-  const int Nu = p_.Nu;
-  const int Nt = p_.Nt;
-
-  // Jacobian.cpp 的决策变量维度（原封结构）:
-  // totalDim = Nx*(Nt+1) + Nu*Nt + Nx*Nt
-  // 这里最后的 Nx*Nt 你 Jacobian.cpp 也保留了（虽然没有显式用到）
-  const int totalDim = Nx*(Nt+1) + Nu*Nt + Nx*Nt;
-  const int n = totalDim;
-  const int m = n;  // Jacobian.cpp: m = n
-
-  solver_upper_.settings()->setWarmStart(true);
-  solver_upper_.settings()->setVerbosity(false);
-  solver_upper_.settings()->setRelativeTolerance(1e-5);
-  solver_upper_.settings()->setAdaptiveRho(true);
-  solver_upper_.settings()->setMaxIteration(5000);
-
-  solver_upper_.data()->setNumberOfVariables(n);
-  solver_upper_.data()->setNumberOfConstraints(m);
-
-  // allocate sparse with diagonal zeros
-  H_.resize(n,n);
-  {
-    std::vector<Eigen::Triplet<double>> tri;
-    tri.reserve(n);
-    for(int i=0;i<n;i++) tri.emplace_back(i,i,0.0);
-    H_.setFromTriplets(tri.begin(), tri.end());
-  }
-
-  A_.resize(m,n);
-  {
-    std::vector<Eigen::Triplet<double>> tri;
-    tri.reserve(std::min(m,n));
-    for(int i=0;i<std::min(m,n);i++) tri.emplace_back(i,i,0.0);
-    A_.setFromTriplets(tri.begin(), tri.end());
-  }
-
-  q_ = Eigen::VectorXd::Zero(n);
-  l_ = Eigen::VectorXd::Zero(m);
-  u_ = Eigen::VectorXd::Zero(m);
-
-  if (!solver_upper_.data()->setHessianMatrix(H_)) return false;
-  if (!solver_upper_.data()->setGradient(q_)) return false;
-  if (!solver_upper_.data()->setLinearConstraintsMatrix(A_)) return false;
-  if (!solver_upper_.data()->setLowerBound(l_)) return false;
-  if (!solver_upper_.data()->setUpperBound(u_)) return false;
-
-  if (!solver_upper_.initSolver()) return false;
-
-  primal_last_ = Eigen::VectorXd::Zero(n);
-  dual_last_   = Eigen::VectorXd::Zero(m);
-
-  solver_initialized_ = true;
-  return true;
-}
-
-// ======== math helpers (ported from Jacobian.cpp) ========
-
-Eigen::Matrix3d GMPCDualLayer::skew(const Eigen::Vector3d& v) {
-  Eigen::Matrix3d m;
-  m << 0, -v(2), v(1),
-       v(2), 0, -v(0),
-      -v(1), v(0), 0;
-  return m;
-}
-
-Eigen::Matrix<double,6,6> GMPCDualLayer::calculateAdjoint(const Eigen::Matrix<double,6,1>& x) {
-  Eigen::Matrix<double,6,6> adj;
-  Eigen::Vector3d w = x.head<3>();
-  Eigen::Vector3d v = x.tail<3>();
-
-  adj.block<3,3>(0,0) = skew(w);
-  adj.block<3,3>(0,3) = Eigen::Matrix3d::Zero();
-  adj.block<3,3>(3,0) = skew(v);
-  adj.block<3,3>(3,3) = skew(w);
-  return adj;
-}
-
-Eigen::Matrix4d GMPCDualLayer::matrix_logarithm(const Eigen::Matrix4d& X) {
-  Eigen::Matrix3d R = X.block<3,3>(0,0);
-  Eigen::Vector3d t = X.block<3,1>(0,3);
-
-  Eigen::Matrix4d logX = Eigen::Matrix4d::Zero();
-
-  const double c = (R.trace() - 1.0) / 2.0;
-  double cc = std::min(1.0, std::max(-1.0, c));
-  double theta = std::acos(cc);
-
-  if (theta < 1e-10) {
-    logX.block<3,3>(0,0) = Eigen::Matrix3d::Zero();
-  } else {
-    logX.block<3,3>(0,0) = theta * (R - R.transpose()) / (2.0 * std::sin(theta));
-  }
-
-  // NOTE: keep the same simplification as your Jacobian.cpp: translation part = t
-  logX.block<3,1>(0,3) = t;
-
-  return logX;
-}
-
-Eigen::Matrix<double,12,1> GMPCDualLayer::calculateErrorVector(
-    const DesiredState13& xd,
-    const Eigen::Quaterniond& q0,
-    const Eigen::Vector3d& p0,
-    const Eigen::Matrix<double,6,1>& V0) {
-
-  Eigen::Quaterniond qd(xd.v(0), xd.v(1), xd.v(2), xd.v(3));
-  Eigen::Vector3d pd(xd.v(4), xd.v(5), xd.v(6));
-
-  Eigen::Matrix3d Rd = qd.toRotationMatrix();
-  Eigen::Matrix3d R0 = q0.toRotationMatrix();
-
-  Eigen::Matrix4d Xd = Eigen::Matrix4d::Identity();
-  Eigen::Matrix4d X00= Eigen::Matrix4d::Identity();
-
-  Xd.block<3,3>(0,0)  = Rd;
-  Xd.block<3,1>(0,3)  = pd;
-  X00.block<3,3>(0,0) = R0;
-  X00.block<3,1>(0,3) = p0;
-
-  Eigen::Matrix4d Xerr = X00.inverse() * Xd;
-  Eigen::Matrix4d logX = matrix_logarithm(Xerr);
-
-  Eigen::Matrix3d log_R = logX.block<3,3>(0,0);
-  Eigen::Vector3d log_p = logX.block<3,1>(0,3);
-
-  Eigen::Matrix<double,12,1> e;
-  e << log_R(2,1), log_R(0,2), log_R(1,0),
-       log_p(0), log_p(1), log_p(2),
-       V0(0), V0(1), V0(2), V0(3), V0(4), V0(5);
-
-  return e;
-}
-
-Eigen::MatrixXd GMPCDualLayer::solveDARE(
-    const Eigen::MatrixXd& A, const Eigen::MatrixXd& B,
-    const Eigen::MatrixXd& Q, const Eigen::MatrixXd& R,
-    int max_iter, double tol) {
-  // Iterative solution (Kleinman-like fixed-point)
-  Eigen::MatrixXd P = Q;
-  for (int k = 0; k < max_iter; ++k) {
-    Eigen::MatrixXd BtP = B.transpose() * P;
-    Eigen::MatrixXd S = R + BtP * B;
-    Eigen::MatrixXd K = S.ldlt().solve(BtP * A);
-    Eigen::MatrixXd Pn = A.transpose() * P * (A - B * K) + Q;
-    double err = (Pn - P).norm();
-    P = Pn;
-    if (err < tol) break;
-  }
-  return P;
-}
-
-Eigen::Matrix<double,7,6> GMPCDualLayer::dampedLeastSquaresJinv(
-    const Eigen::Matrix<double,6,7>& J, double lambda) {
-  // J_inv = J^T (J J^T + λ^2 I)^-1   (same as your MATLAB)
-  Eigen::Matrix<double,6,6> JJt = J * J.transpose();
-  Eigen::Matrix<double,6,6> A = JJt + (lambda*lambda) * Eigen::Matrix<double,6,6>::Identity();
-  Eigen::Matrix<double,6,6> Ainv = A.inverse();
-  Eigen::Matrix<double,7,6> Jinv = J.transpose() * Ainv;
+// Damped pseudoinverse of J (6x7): J^T (J J^T + lambda^2 I)^-1
+static inline Eigen::Matrix<double, 7, 6> dampedPinvJT(
+    const Eigen::Matrix<double, 6, 7>& J, double lambda) {
+  Eigen::Matrix<double, 6, 6> JJt = J * J.transpose();
+  Eigen::Matrix<double, 6, 6> reg = JJt + (lambda * lambda) * Eigen::Matrix<double, 6, 6>::Identity();
+  Eigen::Matrix<double, 7, 6> Jinv = J.transpose() * reg.inverse();
   return Jinv;
 }
 
-// ======== Upper QP (ported structure from Jacobian.cpp) ========
+// Compute condition number approx for J using SVD
+static inline double condNumber(const Eigen::Matrix<double, 6, 7>& J) {
+  Eigen::JacobiSVD<Eigen::MatrixXd> svd(J, Eigen::ComputeThinU | Eigen::ComputeThinV);
+  const auto& s = svd.singularValues();
+  if (s.size() == 0) return std::numeric_limits<double>::infinity();
+  const double smax = s(0);
+  const double smin = s(s.size() - 1);
+  if (smin <= 1e-12) return std::numeric_limits<double>::infinity();
+  return smax / smin;
+}
 
-void GMPCDualLayer::updateCostFunction(
-    const Eigen::Matrix<double,12,1>& /*p0*/,
-    const std::vector<DesiredState13>& xd_seq) {
+static inline double manipulabilityMeasure(const Eigen::Matrix<double, 6, 7>& J) {
+  // sqrt(det(J J^T)) can be computed via SVD: product of singular values
+  Eigen::JacobiSVD<Eigen::MatrixXd> svd(J, Eigen::ComputeThinU | Eigen::ComputeThinV);
+  const auto& s = svd.singularValues();
+  double prod = 1.0;
+  for (int i = 0; i < s.size(); ++i) prod *= s(i);
+  return prod;
+}
 
-  const int Nx = p_.Nx;
-  const int Nu = p_.Nu;
-  const int Nt = p_.Nt;
+// SE(3) log: input T in SE(3), output 4x4 matrix in se(3)
+// We use Eigen's matrix log for simplicity (works for general matrices).
+// Then extract phi as in MATLAB:
+//   w = [X0(3,2); X0(1,3); X0(2,1)]   (1-indexed)
+//   p = X0(1:3,4)
+static inline Eigen::Matrix<double, 6, 1> se3LogPhi(const Eigen::Matrix4d& T_err) {
+  Eigen::Matrix4d X0 = T_err.log();  // requires MatrixFunctions
+  Eigen::Matrix<double, 6, 1> phi;
+  phi(0) = X0(2,1);  // (3,2) in MATLAB
+  phi(1) = X0(0,2);  // (1,3)
+  phi(2) = X0(1,0);  // (2,1)
+  phi(3) = X0(0,3);
+  phi(4) = X0(1,3);
+  phi(5) = X0(2,3);
+  return phi;
+}
 
-  const int totalDim = Nx*(Nt+1) + Nu*Nt + Nx*Nt;
+static inline Eigen::Matrix4d poseToT(const Eigen::Quaterniond& q, const Eigen::Vector3d& p) {
+  Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
+  T.block<3,3>(0,0) = q.normalized().toRotationMatrix();
+  T.block<3,1>(0,3) = p;
+  return T;
+}
 
-  Eigen::SparseMatrix<double> H(totalDim, totalDim);
-  Eigen::VectorXd q = Eigen::VectorXd::Zero(totalDim);
-
-  std::vector<Eigen::Triplet<double>> tri;
-  tri.reserve(Nx*Nx*Nt + Nu*Nt + Nx*Nx);
-
-  // build stage cost blocks (Jacobian.cpp style)
-  for (int k = 0; k < Nt; ++k) {
-    Eigen::MatrixXd C = Eigen::MatrixXd::Identity(Nx, Nx);
-
-    Eigen::Matrix<double,6,1> Vd;
-    Vd << xd_seq[k].v(7), xd_seq[k].v(8), xd_seq[k].v(9), xd_seq[k].v(10), xd_seq[k].v(11), xd_seq[k].v(12);
-
-    Eigen::Matrix<double,6,6> adj = calculateAdjoint(Vd);
-    C.block(6,0,6,6) = -adj;
-
-    const Eigen::MatrixXd& Qk = (k < Nt-1) ? p_.Q : p_.P;
-    Eigen::MatrixXd Hx = C.transpose() * Qk * C;
-
-    for (int i=0;i<Nx;i++) {
-      for (int j=0;j<Nx;j++) {
-        double val = Hx(i,j);
-        if (std::abs(val) > 1e-12) tri.emplace_back(k*Nx+i, k*Nx+j, val);
-      }
+// Convert dense to sparse (row-major build)
+static inline Eigen::SparseMatrix<double> denseToSparse(const Eigen::MatrixXd& D, double prune_eps = 0.0) {
+  Eigen::SparseMatrix<double> S(D.rows(), D.cols());
+  std::vector<Eigen::Triplet<double>> trips;
+  trips.reserve(static_cast<size_t>(D.rows() * D.cols()));
+  for (int r = 0; r < D.rows(); ++r) {
+    for (int c = 0; c < D.cols(); ++c) {
+      const double v = D(r,c);
+      if (std::abs(v) > prune_eps) trips.emplace_back(r, c, v);
     }
-
-    Eigen::VectorXd b = Eigen::VectorXd::Zero(Nx);
-    b.tail(6) = Vd;
-    q.segment(k*Nx, Nx) = -C.transpose() * Qk * b;
   }
+  S.setFromTriplets(trips.begin(), trips.end());
+  return S;
+}
 
-  // input cost
-  for (int k=0;k<Nt;k++) {
-    for (int i=0;i<Nu;i++) {
-      double val = p_.R(i,i);
-      if (std::abs(val) > 1e-12) {
-        tri.emplace_back(Nx*(Nt+1) + k*Nu + i,
-                         Nx*(Nt+1) + k*Nu + i,
-                         val);
-      }
+static inline void addBlockTriplets(std::vector<Eigen::Triplet<double>>& T,
+                                    int row0, int col0,
+                                    const Eigen::MatrixXd& B,
+                                    double prune_eps = 0.0) {
+  for (int r = 0; r < B.rows(); ++r) {
+    for (int c = 0; c < B.cols(); ++c) {
+      const double v = B(r,c);
+      if (std::abs(v) > prune_eps) T.emplace_back(row0 + r, col0 + c, v);
     }
-  }
-
-  H.setFromTriplets(tri.begin(), tri.end());
-
-  H_ = H;
-  q_ = q;
-
-  if (!solver_upper_.updateHessianMatrix(H_)) {
-    std::cerr << "[GMPC] updateHessianMatrix failed\n";
-  }
-  if (!solver_upper_.updateGradient(q_)) {
-    std::cerr << "[GMPC] updateGradient failed\n";
   }
 }
 
-void GMPCDualLayer::updateConstraints(
-    const Eigen::Matrix<double,12,1>& p0,
-    const std::vector<DesiredState13>& xd_seq,
-    const Eigen::Matrix<double,7,7>& M,
-    const Eigen::Matrix<double,7,7>& Cmat,
-    const Eigen::Matrix<double,7,1>& G,
-    const Eigen::Matrix<double,6,7>& J_in,
-    const Eigen::Matrix<double,6,7>& Jdot_in) {
-
-  const int Nx = p_.Nx;
-  const int Nu = p_.Nu;
-  const int Nt = p_.Nt;
-
-  const int Noff = Nx*(Nt+1);
-  const int total_rows = Nx*(Nt+1) + Nu*Nt + Nx*Nt;
-  const int total_cols = Nx*(Nt+1) + Nu*Nt + Nx*Nt;
-
-  Eigen::VectorXd bmin = Eigen::VectorXd::Zero(total_rows);
-  Eigen::VectorXd bmax = Eigen::VectorXd::Zero(total_rows);
-
-  Eigen::Matrix<double,7,7> M_inv = M.inverse();
-
-  // Jacobian.cpp 里做过行交换（把 linear / angular 顺序换一下）
-  // Franka 的 zeroJacobian 通常是 [O] frame: 6x7: top=linear, bottom=angular
-  // Jacobian.cpp 用的是 top=linear bottom=angular，但又做了 swap
-  // 为了跟你 MATLAB/UR5 那套一致，我这里也按 Jacobian.cpp 的 swap 做：
-  Eigen::Matrix<double,6,7> J = J_in;
-  {
-    Eigen::Matrix<double,3,7> tmp = J.block<3,7>(0,0);
-    J.block<3,7>(0,0) = J.block<3,7>(3,0);
-    J.block<3,7>(3,0) = tmp;
+static inline void addIdentityTriplets(std::vector<Eigen::Triplet<double>>& T,
+                                       int row0, int col0, int n, double scale = 1.0) {
+  for (int i = 0; i < n; ++i) {
+    T.emplace_back(row0 + i, col0 + i, scale);
   }
-
-  Eigen::Matrix<double,6,7> Jd = Jdot_in;
-  {
-    Eigen::Matrix<double,3,7> tmp = Jd.block<3,7>(0,0);
-    Jd.block<3,7>(0,0) = Jd.block<3,7>(3,0);
-    Jd.block<3,7>(3,0) = tmp;
-  }
-
-  // pseudo inverse (completeOrthogonalDecomposition like Jacobian.cpp)
-  Eigen::Matrix<double,7,6> J_pinv = J.completeOrthogonalDecomposition().pseudoInverse();
-
-  const Eigen::Matrix<double,6,7> J_M_inv = J * M_inv;
-  const Eigen::Matrix<double,6,1> neg_J_M_inv_G = -J_M_inv * G;
-  const Eigen::Matrix<double,7,7> I7 = Eigen::Matrix<double,7,7>::Identity();
-
-  // Jacobian.cpp: H = J*M^{-1}*(M*J_inv*Jd*J_inv - C*J_inv)
-  // 这里 Cmat 是 joint coriolis matrix (你现在 franka 只有 coriolis vector; 我保留接口给你自己替换)
-  const Eigen::Matrix<double,7,7> term = (M * (J_pinv * Jd) * J_pinv) - (Cmat * J_pinv);
-  const Eigen::Matrix<double,6,6> H = J_M_inv * term; // 6x6
-
-  Eigen::Matrix<double,12,12> Ac = Eigen::Matrix<double,12,12>::Zero();
-  Eigen::Matrix<double,12,7>  Bc = Eigen::Matrix<double,12,7>::Zero();
-  Eigen::Matrix<double,12,1>  hc = Eigen::Matrix<double,12,1>::Zero();
-
-  Bc.bottomRows(6) = J_M_inv;  // 6x7
-
-  std::vector<Eigen::Triplet<double>> tri;
-  tri.reserve( Nx*Nx*(Nt+1) + Nx*Nx*Nt + Nx*Nu*Nt + Nu*Nt + Nx*Nt );
-
-  const Eigen::Matrix<double,12,12> I_Nx = Eigen::Matrix<double,12,12>::Identity();
-  const Eigen::Matrix<double,6,6>  I6    = Eigen::Matrix<double,6,6>::Identity();
-
-  Eigen::Matrix<double,12,12> A_sub = Eigen::Matrix<double,12,12>::Zero();
-  Eigen::Matrix<double,12,7>  B_sub = Eigen::Matrix<double,12,7>::Zero();
-
-  for (int k=0;k<Nt;k++) {
-    Eigen::Matrix<double,6,1> Vd;
-    Vd << xd_seq[k].v(7), xd_seq[k].v(8), xd_seq[k].v(9), xd_seq[k].v(10), xd_seq[k].v(11), xd_seq[k].v(12);
-
-    Ac.topLeftCorner(6,6)  = -calculateAdjoint(Vd);
-    Ac.topRightCorner(6,6) = -I6;
-    Ac.bottomRightCorner(6,6) = H;
-
-    hc.head(6) = Vd;
-    hc.tail(6) = neg_J_M_inv_G;
-
-    Eigen::Matrix<double,12,12> Ad = I_Nx + Ac * p_.dt;
-    Eigen::Matrix<double,12,7>  Bd = Bc * p_.dt;
-    Eigen::Matrix<double,12,1>  hd = hc * p_.dt;
-
-    if (k==0) { A_sub = Ad; B_sub = Bd; }
-
-    // dynamics: -Ad * x_k + I * x_{k+1} -Bd * u_k = hd
-    for (int i=0;i<Nx;i++) {
-      for (int j=0;j<Nx;j++) {
-        double val = -Ad(i,j);
-        if (std::abs(val) > 1e-10) tri.emplace_back(k*Nx+i, k*Nx+j, val);
-      }
-    }
-    for (int i=0;i<Nx;i++) tri.emplace_back(k*Nx+i, (k+1)*Nx+i, 1.0);
-
-    for (int i=0;i<Nx;i++) {
-      for (int j=0;j<Nu;j++) {
-        double val = -Bd(i,j);
-        if (std::abs(val) > 1e-10) tri.emplace_back(k*Nx+i, Noff + k*Nu + j, val);
-      }
-    }
-
-    // state bounds rows (same as Jacobian.cpp): I * x_{k+1}
-    for (int i=0;i<Nx;i++) {
-      tri.emplace_back(Noff + Nu*Nt + k*Nx + i, (k+1)*Nx + i, 1.0);
-    }
-
-    // input bounds rows: I * u_k
-    for (int i=0;i<Nu;i++) {
-      tri.emplace_back(Noff + k*Nu + i, Noff + k*Nu + i, 1.0);
-    }
-
-    bmin.segment(k*Nx, Nx) = hd;
-    bmax.segment(k*Nx, Nx) = hd;
-    bmin.segment(Noff + Nu*Nt + k*Nx, Nx) = p_.xmin;
-    bmax.segment(Noff + Nu*Nt + k*Nx, Nx) = p_.xmax;
-  }
-
-  // initial state constraint: x0 = p0   (row Nt*Nx ... Nt*Nx+Nx-1)
-  for (int i=0;i<Nx;i++) tri.emplace_back(Nt*Nx + i, i, 1.0);
-  bmin.segment(Nt*Nx, Nx) = p0;
-  bmax.segment(Nt*Nx, Nx) = p0;
-
-  // input bounds stacked
-  for (int k=0;k<Nt;k++) {
-    bmin.segment(Noff + k*Nu, Nu) = p_.umin;
-    bmax.segment(Noff + k*Nu, Nu) = p_.umax;
-  }
-
-  Eigen::SparseMatrix<double> A(total_rows, total_cols);
-  A.setFromTriplets(tri.begin(), tri.end());
-  A_ = A;
-  l_ = bmin;
-  u_ = bmax;
-
-  if (!solver_upper_.updateLinearConstraintsMatrix(A_)) {
-    std::cerr << "[GMPC] updateLinearConstraintsMatrix failed\n";
-  }
-  if (!solver_upper_.updateBounds(l_, u_)) {
-    std::cerr << "[GMPC] updateBounds failed\n";
-  }
-
-  // Update terminal P (idare-like): from your MATLAB param.P = idare(-A,-B,Q,R)
-  // Here we compute P from discrete (Ad,Bd) with DARE:
-  Eigen::MatrixXd Ad_d = A_sub;
-  Eigen::MatrixXd Bd_d = B_sub;
-
-  p_.P = solveDARE(Ad_d, Bd_d, p_.Q, p_.R, 200, 1e-8);
 }
 
-bool GMPCDualLayer::solveUpperQP(Eigen::VectorXd* full_solution, Eigen::Matrix<double,7,1>* u_primary) {
-  if (!solver_initialized_) return false;
+// ------------------------------ Parameters ------------------------------
 
-  // warm start
-  if (primal_last_.size() == solver_upper_.data()->getNumberOfVariables()) {
-    solver_upper_.setWarmStart(true);
-    solver_upper_.warmStart(primal_last_, dual_last_);
+struct GMPCParams {
+  // Dimensions (fixed for this implementation)
+  static constexpr int Nx = 12;  // state: [phi(6); V(6)]
+  static constexpr int Nu = 7;   // control: joint torques (or torque control term)
+  int Nt = 10;                   // horizon length
+  double dt = 0.001;             // controller dt (should match Franka loop)
+
+  // Weights (Primary)
+  Eigen::Matrix<double, 12, 12> Q = Eigen::Matrix<double, 12, 12>::Identity();
+  Eigen::Matrix<double, 12, 12> P = Eigen::Matrix<double, 12, 12>::Identity();
+  Eigen::Matrix<double, 7, 7>  R = 1e-8 * Eigen::Matrix<double, 7, 7>::Identity();
+
+  // Optional delta-u weight for Primary (like MATLAB param.R_delta)
+  bool use_R_delta = false;
+  Eigen::Matrix<double, 7, 7> R_delta = Eigen::Matrix<double, 7, 7>::Zero();
+  Eigen::Matrix<double, 7, 7> R_cross = Eigen::Matrix<double, 7, 7>::Zero();
+
+  // Control bounds
+  Eigen::Matrix<double, 7, 1> umin = (-50.0) * Eigen::Matrix<double, 7, 1>::Ones();
+  Eigen::Matrix<double, 7, 1> umax = ( 50.0) * Eigen::Matrix<double, 7, 1>::Ones();
+
+  // Hard torque change bounds within horizon (|u_k - u_{k-1}| <= max)
+  Eigen::Matrix<double, 7, 1> du_max = (20.0) * Eigen::Matrix<double, 7, 1>::Ones();
+
+  // Cross-cycle first-step change bound around u_prev
+  Eigen::Matrix<double, 7, 1> du_cross_max = (10.0) * Eigen::Matrix<double, 7, 1>::Ones();
+
+  // State bounds (error bounds)
+  // Following MATLAB style, but you should tune to your application.
+  Eigen::Matrix<double, 12, 1> xmin = (-10.0) * Eigen::Matrix<double, 12, 1>::Ones();
+  Eigen::Matrix<double, 12, 1> xmax = ( 10.0) * Eigen::Matrix<double, 12, 1>::Ones();
+
+  // "Actual" pose error bounds around target (position/orientation/velocity)
+  Eigen::Matrix<double, 3, 1> xmin_rot = (-10.0) * Eigen::Matrix<double, 3, 1>::Ones();
+  Eigen::Matrix<double, 3, 1> xmax_rot = ( 10.0) * Eigen::Matrix<double, 3, 1>::Ones();
+
+  Eigen::Matrix<double, 3, 1> xmin_pos = (-0.2) * Eigen::Matrix<double, 3, 1>::Ones();
+  Eigen::Matrix<double, 3, 1> xmax_pos = ( 0.2) * Eigen::Matrix<double, 3, 1>::Ones();
+
+  Eigen::Matrix<double, 6, 1> xmin_vel = (-2.0) * Eigen::Matrix<double, 6, 1>::Ones();
+  Eigen::Matrix<double, 6, 1> xmax_vel = ( 2.0) * Eigen::Matrix<double, 6, 1>::Ones();
+
+  // Secondary layer parameters
+  double alpha_tolerance = 0.95;
+  double delta_deviation = 0.001;  // deviation box around primary solution
+  Eigen::Matrix<double, 7, 7> R_null = Eigen::Matrix<double, 7, 7>::Identity();
+  double w_smooth = 1e-8;
+  double w_null = 1e-6;
+};
+
+// ------------------------------ IO struct ------------------------------
+
+struct GMPCInput {
+  // Current robot state
+  Eigen::Matrix<double, 7, 1> q;
+  Eigen::Matrix<double, 7, 1> dq;
+
+  // Current EE pose in base frame (O frame in Franka)
+  Eigen::Quaterniond orientation;
+  Eigen::Vector3d position;
+
+  // Desired EE pose
+  Eigen::Quaterniond orientation_d;
+  Eigen::Vector3d position_d;
+
+  // Desired twist Vd in base frame (6x1)
+  Eigen::Matrix<double, 6, 1> Vd;
+
+  // Model terms
+  Eigen::Matrix<double, 7, 7> M;
+  Eigen::Matrix<double, 7, 1> coriolis;
+  Eigen::Matrix<double, 7, 1> gravity;
+
+  // Jacobian (base frame) and optional Jdot estimate if you have it
+  Eigen::Matrix<double, 6, 7> J;
+};
+
+// ------------------------------ Dual-layer GMPC Solver ------------------------------
+
+class DualLayerGMPC {
+public:
+  DualLayerGMPC() = default;
+
+  void setParams(const GMPCParams& p) {
+    params_ = p;
+    resetWarmStart();
   }
 
-  auto flag = solver_upper_.solveProblem();
-  if (flag != OsqpEigen::ErrorExitFlag::NoError) {
-    std::cerr << "[GMPC] OSQP upper solve failed\n";
-    return false;
+  const GMPCParams& params() const { return params_; }
+
+  void resetWarmStart() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    primary_initialized_ = false;
+    secondary_initialized_ = false;
+    primary_primal_.resize(0);
+    primary_dual_.resize(0);
+    secondary_primal_.resize(0);
+    secondary_dual_.resize(0);
+    J_prev_valid_ = false;
+    J_prev_.setZero();
+    last_u_cmd_.setZero();
+    last_u_prev_valid_ = false;
   }
 
-  Eigen::VectorXd sol = solver_upper_.getSolution();
-  Eigen::VectorXd dual= solver_upper_.getDualSolution();
+  // Main entry: compute torque control term u (7x1).
+  // Recommended usage in CartesianImpedanceController:
+  //   u = gmpc.computeTau(in);
+  //   tau_cmd = u + coriolis; (and then saturateTorqueRate)
+  Eigen::Matrix<double, 7, 1> computeTau(const GMPCInput& in) {
+    std::lock_guard<std::mutex> lock(mutex_);
 
-  primal_last_ = sol;
-  dual_last_   = dual;
+    // ----------- Build p0 (initial state) = [phi; V_current] -----------
+    // MATLAB: X00 = X00^{-1} * Xd; X0 = logm(X00); phi from X0, then append x0(8:end) as current twist.
+    // Here: phi = log( T_cur^{-1} T_des ), and V_current = J * dq
+    const Eigen::Matrix4d T_cur = poseToT(in.orientation, in.position);
+    const Eigen::Matrix4d T_des = poseToT(in.orientation_d, in.position_d);
+    const Eigen::Matrix4d T_err = T_cur.inverse() * T_des;
 
-  *full_solution = sol;
+    const Eigen::Matrix<double, 6, 1> phi = se3LogPhi(T_err);
+    const Eigen::Matrix<double, 6, 1> V_cur = in.J * in.dq;
 
-  const int Nx = p_.Nx;
-  const int Nu = p_.Nu;
-  const int Nt = p_.Nt;
+    Eigen::Matrix<double, 12, 1> p0;
+    p0 << phi, V_cur;
 
-  const int startU = Nx*(Nt+1);
-  *u_primary = sol.segment(startU, Nu);
-  return true;
-}
+    // Desired twist trajectory over horizon: we follow MATLAB xid(k,:) = desired twist samples.
+    // Here we keep it constant for the horizon (can be replaced by a provided buffer).
+    std::vector<Eigen::Matrix<double, 6, 1>> Vd_seq(params_.Nt);
+    for (int k = 0; k < params_.Nt; ++k) Vd_seq[k] = in.Vd;
 
-// ======== Lower QP (ported from your MATLAB solveSecondaryMPC_Modified) ========
+    // ----------- Adaptive damping & nullspace projector N -----------
+    const double condJ = condNumber(in.J);
+    const double manip = manipulabilityMeasure(in.J);
 
-bool GMPCDualLayer::solveSecondaryQP(
-    const Eigen::VectorXd& upper_full_solution,
-    const Eigen::Matrix<double,7,1>& u_primary_first,
-    const Eigen::Matrix<double,7,1>& u_prev,
-    const Eigen::Matrix<double,6,7>& J,
-    Eigen::Matrix<double,7,1>* u_final_first) {
-
-  const int Nu = p_.Nu;
-  const int Nt = p_.Nt;
-
-  // Extract full primary control sequence from upper solution
-  const int Nx = p_.Nx;
-  const int startU = Nx*(Nt+1);
-  Eigen::VectorXd u_primary_full = upper_full_solution.segment(startU, Nu*Nt);
-
-  // reshape to Nt x Nu (row-major)
-  std::vector<Eigen::Matrix<double,7,1>> uref_seq(Nt);
-  for (int k=0;k<Nt;k++) {
-    uref_seq[k] = u_primary_full.segment(k*Nu, Nu);
-  }
-
-  // N projector (your MATLAB: J_inv = J' * inv(JJ'+λ^2I), N=I-J_inv*J)
-  // adaptive lambda (same idea as MATLAB: cond/manipulability)
-  double manipulability = std::sqrt(std::max(1e-12, (J*J.transpose()).determinant()));
-  double condJ = 1e6;
-  {
-    Eigen::JacobiSVD<Eigen::Matrix<double,6,7>> svd(J);
-    double smin = svd.singularValues().tail(1)(0);
-    double smax = svd.singularValues()(0);
-    if (smin > 1e-12) condJ = smax/smin;
-  }
-
-  double lambda = p_.lambda_dls;
-  if (condJ > 10.0) lambda = p_.lambda_dls * condJ / 10.0;
-  else if (manipulability < 0.01) lambda = p_.lambda_dls * (0.01 / manipulability);
-  lambda = std::min(lambda, 0.5);
-
-  Eigen::Matrix<double,7,6> Jinv = dampedLeastSquaresJinv(J, lambda);
-  Eigen::Matrix<double,7,7> Nproj = Eigen::Matrix<double,7,7>::Identity() - Jinv * J;
-  Eigen::Matrix<double,7,7> Nw = Nproj.transpose() * p_.R_null * Nproj;
-
-  // decision variable: U = [u0;u1;...;u_{Nt-1}]  size=Nu*Nt
-  const int n = Nu*Nt;
-
-  // Build Hessian (dense then sparse) for:
-  // w_smooth*Σ||u_k-u_{k-1}||^2_{R_smooth} + w_null*Σ u_k^T Nw u_k
-  Eigen::MatrixXd Hd = Eigen::MatrixXd::Zero(n,n);
-  Eigen::VectorXd q  = Eigen::VectorXd::Zero(n);
-
-  // smoothness
-  for (int k=0;k<Nt;k++) {
-    int si = k*Nu;
-    Hd.block(si,si,Nu,Nu) += p_.w_smooth * p_.R_smooth;
-
-    if (k==0) {
-      if (u_prev.size()==Nu) {
-        q.segment(si,Nu) += (-p_.w_smooth) * (p_.R_smooth * u_prev);
-      }
+    double lambda_base = 0.01;
+    double lambda;
+    if (condJ > 10.0) {
+      lambda = lambda_base * condJ / 10.0;
+    } else if (manip < 0.01) {
+      lambda = lambda_base * (0.01 / std::max(manip, 1e-12));
     } else {
-      int pi = (k-1)*Nu;
-      Hd.block(pi,pi,Nu,Nu) += p_.w_smooth * p_.R_smooth;
-      Hd.block(si,pi,Nu,Nu) += (-p_.w_smooth) * p_.R_smooth;
-      Hd.block(pi,si,Nu,Nu) += (-p_.w_smooth) * p_.R_smooth;
+      lambda = lambda_base;
+    }
+    lambda = std::min(lambda, 0.2);
+
+    const Eigen::Matrix<double, 7, 6> J_pinv = dampedPinvJT(in.J, lambda);
+    const Eigen::Matrix<double, 7, 7> Nproj = Eigen::Matrix<double, 7, 7>::Identity() - J_pinv * in.J;
+
+    // ----------- Primary layer solve -----------
+    Eigen::VectorXd sol1_x;
+    int status1 = 0;
+    Eigen::Matrix<double, 7, 1> u_primary = Eigen::Matrix<double, 7, 1>::Zero();
+
+    {
+      PrimaryQP qp1 = buildPrimaryQP(in, p0, Vd_seq);
+      status1 = solveOSQPPrimary(qp1, &sol1_x);
+      if (status1 == 1 && sol1_x.size() == qp1.nvar) {
+        // Extract u_primary = first control at time k=0
+        const int state_vars = (params_.Nt + 1) * GMPCParams::Nx;
+        u_primary = sol1_x.segment(state_vars, GMPCParams::Nu);
+      } else {
+        // Fallback: if primary fails, output zero control term
+        u_primary.setZero();
+        // Still update last command for continuity
+        last_u_cmd_ = u_primary;
+        last_u_prev_valid_ = true;
+        return u_primary;
+      }
+    }
+
+    // ----------- Build feasible set for secondary -----------
+    FeasibleSet fs;
+    fs.full_solution = sol1_x;
+    fs.u_primary_first = u_primary;
+    fs.alpha = params_.alpha_tolerance;
+    fs.deviation_bound = params_.delta_deviation;
+
+    // ----------- Secondary layer solve -----------
+    Eigen::Matrix<double, 7, 1> u_final = u_primary;
+    int status2 = 0;
+    Eigen::VectorXd sol2_x;
+
+    {
+      SecondaryQP qp2 = buildSecondaryQP(fs, Nproj);
+      status2 = solveOSQPSecondary(qp2, &sol2_x);
+
+      if (status2 == 1 && sol2_x.size() == qp2.nvar) {
+        // sol2 is stacked [u0; u1; ... u_{Nt-1}] (Nu*Nt)
+        u_final = sol2_x.segment(0, GMPCParams::Nu);
+        // performance degradation check (same idea as MATLAB)
+        const double degr = evaluatePerformanceDegradation(u_final, u_primary);
+        if (degr > (1.0 - fs.alpha)) {
+          // too much degradation -> keep primary
+          u_final = u_primary;
+        }
+      } else {
+        u_final = u_primary;
+      }
+    }
+
+    last_u_cmd_ = u_final;
+    last_u_prev_valid_ = true;
+    return u_final;
+  }
+
+  // Provide last command for cross-cycle constraint
+  bool hasLastU() const { return last_u_prev_valid_; }
+  Eigen::Matrix<double, 7, 1> lastU() const { return last_u_cmd_; }
+
+private:
+  // ---------------- Primary QP container ----------------
+  struct PrimaryQP {
+    int nvar = 0;
+    int ncon = 0;
+    Eigen::SparseMatrix<double> H;
+    Eigen::VectorXd g;
+    Eigen::SparseMatrix<double> A;
+    Eigen::VectorXd l;
+    Eigen::VectorXd u;
+  };
+
+  // ---------------- Secondary QP container ----------------
+  struct SecondaryQP {
+    int nvar = 0;
+    int ncon = 0;
+    Eigen::SparseMatrix<double> H;
+    Eigen::VectorXd g;
+    Eigen::SparseMatrix<double> A;
+    Eigen::VectorXd l;
+    Eigen::VectorXd u;
+  };
+
+  struct FeasibleSet {
+    Eigen::VectorXd full_solution;          // full primary solution
+    Eigen::Matrix<double, 7, 1> u_primary_first;
+    double alpha = 0.95;
+    double deviation_bound = 0.001;
+  };
+
+  // Build Jdot estimate
+  Eigen::Matrix<double, 6, 7> estimateJdot(const Eigen::Matrix<double, 6, 7>& J, double dt) {
+    Eigen::Matrix<double, 6, 7> Jdot = Eigen::Matrix<double, 6, 7>::Zero();
+    if (J_prev_valid_) {
+      Jdot = (J - J_prev_) / std::max(dt, 1e-6);
+    }
+    J_prev_ = J;
+    J_prev_valid_ = true;
+    return Jdot;
+  }
+
+  // ---------------- Primary QP build ----------------
+  PrimaryQP buildPrimaryQP(const GMPCInput& in,
+                           const Eigen::Matrix<double, 12, 1>& p0,
+                           const std::vector<Eigen::Matrix<double, 6, 1>>& Vd_seq) {
+    const int Nx = GMPCParams::Nx;
+    const int Nu = GMPCParams::Nu;
+    const int Nt = params_.Nt;
+    const double dt = params_.dt;
+
+    // Variables: X(0..Nt) (Nx*(Nt+1)) + U(0..Nt-1) (Nu*Nt)
+    const int nvar = Nx * (Nt + 1) + Nu * Nt;
+
+    // Constraint blocks:
+    // 1) Dynamics: Nx*Nt
+    // 2) Initial state: Nx
+    // 3) State bounds for k=1..Nt: Nx*Nt
+    // 4) Control bounds: Nu*Nt
+    // 5) Cross-cycle first-step change: Nu (if last_u exists)
+    // 6) Hard delta-u within horizon: Nu*(Nt-1)
+    const bool has_prev = last_u_prev_valid_;
+    const int ncon =
+        (Nx * Nt) + Nx + (Nx * Nt) + (Nu * Nt) + (has_prev ? Nu : 0) + (Nu * (Nt - 1));
+
+    PrimaryQP qp;
+    qp.nvar = nvar;
+    qp.ncon = ncon;
+
+    // --------- Build H and g (cost) ---------
+    // Following MATLAB buildPrimaryCost():
+    // For k=1..Nt:
+    //   C = I; C(7:12,1:6) = -ad(Vd_k)
+    //   b = [0; Vd_k] used to form q linear term: -C'Q b
+    //   State block: C'Q C (or C'P C at final)
+    // Control block: R (and optional delta-u)
+    //
+    // We'll build sparse using triplets.
+    std::vector<Eigen::Triplet<double>> Ht;
+    Ht.reserve(static_cast<size_t>(nvar * 5));  // rough
+
+    qp.g = Eigen::VectorXd::Zero(nvar);
+
+    for (int k = 1; k <= Nt; ++k) {
+      Eigen::Matrix<double, 12, 12> Cmap = Eigen::Matrix<double, 12, 12>::Identity();
+      Cmap.block<6,6>(6,0) = -ad6(Vd_seq[std::min(k-1, Nt-1)]);
+
+      Eigen::Matrix<double, 12, 12> W = (k < Nt) ? params_.Q : params_.P;
+      Eigen::Matrix<double, 12, 12> Hblk = Cmap.transpose() * W * Cmap;
+
+      Eigen::Matrix<double, 12, 1> bvec = Eigen::Matrix<double, 12, 1>::Zero();
+      bvec.segment<6>(6) = Vd_seq[std::min(k-1, Nt-1)];
+      Eigen::Matrix<double, 12, 1> gblk = -Cmap.transpose() * W * bvec;
+
+      const int idx0 = k * Nx;  // X_k starts at k*Nx
+      // H block
+      for (int r = 0; r < Nx; ++r) {
+        for (int c = 0; c < Nx; ++c) {
+          const double v = Hblk(r,c);
+          if (std::abs(v) > 0.0) Ht.emplace_back(idx0 + r, idx0 + c, v);
+        }
+      }
+      // g block
+      qp.g.segment(idx0, Nx) += gblk;
+    }
+
+    // Control cost: block diagonal R over U sequence
+    const int u_offset = Nx * (Nt + 1);
+    for (int k = 0; k < Nt; ++k) {
+      const int uk = u_offset + k * Nu;
+      for (int r = 0; r < Nu; ++r) {
+        for (int c = 0; c < Nu; ++c) {
+          const double v = params_.R(r,c);
+          if (std::abs(v) > 0.0) Ht.emplace_back(uk + r, uk + c, v);
+        }
+      }
+    }
+
+    // Optional delta-u cost (like MATLAB)
+    if (params_.use_R_delta) {
+      for (int k = 0; k < Nt; ++k) {
+        const int uk = u_offset + k * Nu;
+        if (k == 0) {
+          if (has_prev) {
+            // (u0 - u_prev)^T R_cross (u0 - u_prev)
+            for (int r = 0; r < Nu; ++r) {
+              for (int c = 0; c < Nu; ++c) {
+                const double v = params_.R_cross(r,c);
+                if (std::abs(v) > 0.0) Ht.emplace_back(uk + r, uk + c, v);
+              }
+            }
+            qp.g.segment(uk, Nu) += -(params_.R_cross * last_u_cmd_);
+          }
+        } else {
+          // (uk - u_{k-1})^T R_delta (uk - u_{k-1})
+          const int ukm1 = u_offset + (k - 1) * Nu;
+          // uk^T R uk
+          for (int r = 0; r < Nu; ++r) {
+            for (int c = 0; c < Nu; ++c) {
+              const double v = params_.R_delta(r,c);
+              if (std::abs(v) > 0.0) Ht.emplace_back(uk + r, uk + c, v);
+            }
+          }
+          // u_{k-1}^T R u_{k-1}
+          for (int r = 0; r < Nu; ++r) {
+            for (int c = 0; c < Nu; ++c) {
+              const double v = params_.R_delta(r,c);
+              if (std::abs(v) > 0.0) Ht.emplace_back(ukm1 + r, ukm1 + c, v);
+            }
+          }
+          // cross terms -R
+          for (int r = 0; r < Nu; ++r) {
+            for (int c = 0; c < Nu; ++c) {
+              const double v = -params_.R_delta(r,c);
+              if (std::abs(v) > 0.0) {
+                Ht.emplace_back(uk + r, ukm1 + c, v);
+                Ht.emplace_back(ukm1 + r, uk + c, v);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Regularize to ensure PSD
+    for (int i = 0; i < nvar; ++i) {
+      Ht.emplace_back(i, i, 1e-9);
+    }
+
+    qp.H.resize(nvar, nvar);
+    qp.H.setFromTriplets(Ht.begin(), Ht.end());
+
+    // --------- Build constraints A, l, u ---------
+    std::vector<Eigen::Triplet<double>> At;
+    At.reserve(static_cast<size_t>(ncon * 10));
+    qp.l = Eigen::VectorXd::Constant(ncon, -std::numeric_limits<double>::infinity());
+    qp.u = Eigen::VectorXd::Constant(ncon,  std::numeric_limits<double>::infinity());
+
+    int row = 0;
+
+    // (1) Dynamics constraints: X_{k+1} = Ad X_k + Bd u_k + hd
+    // MATLAB buildPrimaryConstraints used:
+    //  Ac = [ -ad(Vd), -I;
+    //         0,       H ]
+    //  Bc = [ 0;
+    //         F ]
+    //  hc = [ Vd;
+    //         b ]
+    //
+    // Here we use practical affine model:
+    //  phi_dot = -ad(Vd)*phi + V - Vd
+    //  V_dot   = J*M^{-1}*u + (Jdot*dq - J*M^{-1}(coriolis+gravity))
+    //
+    // so:
+    //  d/dt [phi] = (-ad(Vd))*phi + I*V + (-I)*Vd
+    //  d/dt [V]   = 0*phi + 0*V + (J*M^{-1})*u + b_aff
+    //
+    // Discretize:
+    //  X_{k+1} = (I + Ac dt) X_k + (Bc dt) u_k + (hc dt)
+    //
+    const Eigen::Matrix<double, 7, 7> Minv = in.M.inverse();
+    const Eigen::Matrix<double, 6, 7> J = in.J;
+    const Eigen::Matrix<double, 6, 7> Jdot = estimateJdot(in.J, dt);
+
+    const Eigen::Matrix<double, 6, 7> F = J * Minv;  // 6x7
+
+    // b_aff = Jdot*dq - J*M^{-1}*(coriolis+gravity)
+    const Eigen::Matrix<double, 7, 1> tau_bias = in.coriolis + in.gravity;
+    const Eigen::Matrix<double, 6, 1> b_aff = (Jdot * in.dq) - (J * (Minv * tau_bias));
+
+    for (int k = 0; k < Nt; ++k) {
+      const Eigen::Matrix<double, 6, 1> Vd = Vd_seq[k];
+
+      Eigen::Matrix<double, 12, 12> Ac = Eigen::Matrix<double, 12, 12>::Zero();
+      Ac.block<6,6>(0,0) = -ad6(Vd);
+      Ac.block<6,6>(0,6) = -Eigen::Matrix<double,6,6>::Identity();
+      // V dynamics: no dependence on phi,V in this practical form (can be extended)
+      // Ac.block<6,6>(6,0) = 0;
+      // Ac.block<6,6>(6,6) = 0;
+
+      Eigen::Matrix<double, 12, 7> Bc = Eigen::Matrix<double, 12, 7>::Zero();
+      Bc.block<6,7>(6,0) = F;
+
+      Eigen::Matrix<double, 12, 1> hc = Eigen::Matrix<double, 12, 1>::Zero();
+      hc.segment<6>(0) = Vd;
+      hc.segment<6>(6) = b_aff;
+
+      Eigen::Matrix<double, 12, 12> Ad = Eigen::Matrix<double, 12, 12>::Identity() + Ac * dt;
+      Eigen::Matrix<double, 12, 7>  Bd = Bc * dt;
+      Eigen::Matrix<double, 12, 1>  hd = hc * dt;
+
+      // Constraint form:
+      //  -Ad * X_k + I * X_{k+1} + (-Bd)*u_k = hd
+      const int xk  = k * Nx;
+      const int xk1 = (k + 1) * Nx;
+      const int uk  = u_offset + k * Nu;
+
+      // -Ad on X_k
+      addBlockTriplets(At, row, xk, -Ad, 0.0);
+      // +I on X_{k+1}
+      addIdentityTriplets(At, row, xk1, Nx, 1.0);
+      // -Bd on u_k
+      addBlockTriplets(At, row, uk, -Bd, 0.0);
+
+      qp.l.segment(row, Nx) = hd;
+      qp.u.segment(row, Nx) = hd;
+
+      row += Nx;
+    }
+
+    // (2) Initial state: X_0 = p0
+    {
+      addIdentityTriplets(At, row, 0, Nx, 1.0);
+      qp.l.segment(row, Nx) = p0;
+      qp.u.segment(row, Nx) = p0;
+      row += Nx;
+    }
+
+    // (3) State bounds for k=1..Nt
+    // MATLAB computed bounds relative to target pose:
+    //  rot bounds -> phi(1:3), pos bounds -> phi(4:6), vel bounds -> V(1:6)
+    for (int k = 1; k <= Nt; ++k) {
+      const int xk = k * Nx;
+
+      Eigen::Matrix<double, 12, 1> xmin = Eigen::Matrix<double, 12, 1>::Zero();
+      Eigen::Matrix<double, 12, 1> xmax = Eigen::Matrix<double, 12, 1>::Zero();
+
+      // phi bounds
+      xmin.segment<3>(0) = params_.xmin_rot;
+      xmax.segment<3>(0) = params_.xmax_rot;
+      xmin.segment<3>(3) = params_.xmin_pos;
+      xmax.segment<3>(3) = params_.xmax_pos;
+
+      // V bounds
+      xmin.segment<6>(6) = params_.xmin_vel;
+      xmax.segment<6>(6) = params_.xmax_vel;
+
+      // Add constraint: xmin <= X_k <= xmax
+      addIdentityTriplets(At, row, xk, Nx, 1.0);
+      qp.l.segment(row, Nx) = xmin;
+      qp.u.segment(row, Nx) = xmax;
+      row += Nx;
+    }
+
+    // (4) Control bounds for k=0..Nt-1: umin <= u_k <= umax
+    for (int k = 0; k < Nt; ++k) {
+      const int uk = u_offset + k * Nu;
+      addIdentityTriplets(At, row, uk, Nu, 1.0);
+      qp.l.segment(row, Nu) = params_.umin;
+      qp.u.segment(row, Nu) = params_.umax;
+      row += Nu;
+    }
+
+    // (5) Cross-cycle first-step change around last_u_cmd_
+    if (has_prev) {
+      const int u0 = u_offset + 0 * Nu;
+      addIdentityTriplets(At, row, u0, Nu, 1.0);
+      qp.l.segment(row, Nu) = last_u_cmd_ - params_.du_cross_max;
+      qp.u.segment(row, Nu) = last_u_cmd_ + params_.du_cross_max;
+      row += Nu;
+    }
+
+    // (6) Hard delta-u within horizon: |u_k - u_{k-1}| <= du_max, for k=1..Nt-1
+    for (int k = 1; k < Nt; ++k) {
+      const int uk = u_offset + k * Nu;
+      const int ukm1 = u_offset + (k - 1) * Nu;
+
+      // u_k - u_{k-1} <= du_max  and >= -du_max
+      // We implement as:
+      //   A * z in [l,u] with A = [I on uk, -I on ukm1]
+      // so l=-du_max, u=du_max
+      for (int i = 0; i < Nu; ++i) {
+        At.emplace_back(row + i, uk + i, 1.0);
+        At.emplace_back(row + i, ukm1 + i, -1.0);
+      }
+      qp.l.segment(row, Nu) = -params_.du_max;
+      qp.u.segment(row, Nu) =  params_.du_max;
+      row += Nu;
+    }
+
+    if (row != ncon) {
+      // Safety check
+      throw std::runtime_error("Primary QP constraint count mismatch: row != ncon");
+    }
+
+    qp.A.resize(ncon, nvar);
+    qp.A.setFromTriplets(At.begin(), At.end());
+
+    return qp;
+  }
+
+  // ---------------- Secondary QP build ----------------
+  SecondaryQP buildSecondaryQP(const FeasibleSet& fs,
+                               const Eigen::Matrix<double, 7, 7>& Nproj) {
+    const int Nu = GMPCParams::Nu;
+    const int Nt = params_.Nt;
+
+    // Variables: U_seq (Nu*Nt)
+    const int nvar = Nu * Nt;
+
+    // Constraints:
+    // (1) deviation box around primary u_seq: 2*Nu*Nt
+    // (2) control bounds: 2*Nu*Nt
+    const int ncon = 4 * Nu * Nt;
+
+    SecondaryQP qp;
+    qp.nvar = nvar;
+    qp.ncon = ncon;
+
+    // Extract primary full u sequence from full solution:
+    // primary solution layout: [X(0..Nt); U(0..Nt-1)]
+    const int state_vars = (params_.Nt + 1) * GMPCParams::Nx;
+    const int control_vars = GMPCParams::Nu * params_.Nt;
+    if (fs.full_solution.size() < state_vars + control_vars) {
+      throw std::runtime_error("FeasibleSet full_solution has invalid size.");
+    }
+    Eigen::VectorXd u_primary_full = fs.full_solution.segment(state_vars, control_vars);
+
+    // Reshape u_primary_full into Nu x Nt
+    // MATLAB used reshape to (Nt x Nu)
+    std::vector<Eigen::Matrix<double, 7, 1>> uref_seq(params_.Nt);
+    for (int k = 0; k < params_.Nt; ++k) {
+      uref_seq[k] = u_primary_full.segment(k * Nu, Nu);
+    }
+
+    // --------- Secondary cost: smoothness + nullspace preference ---------
+    // M2 = sparse(total_vars,total_vars); q2 = zeros
+    std::vector<Eigen::Triplet<double>> Ht;
+    Ht.reserve(static_cast<size_t>(nvar * 8));
+    qp.g = Eigen::VectorXd::Zero(nvar);
+
+    // Smoothness:
+    // k=0: (u0 - u_prev)^2 if available, else just u0^2
+    // k>0: (uk - u_{k-1})^2
+    const double ws = params_.w_smooth;
+    if (ws > 0.0) {
+      for (int k = 0; k < Nt; ++k) {
+        const int uk = k * Nu;
+        if (k == 0) {
+          // Add ws * I on u0
+          for (int i = 0; i < Nu; ++i) Ht.emplace_back(uk + i, uk + i, ws);
+          if (last_u_prev_valid_) {
+            qp.g.segment(uk, Nu) += -(ws * last_u_cmd_);
+          }
+        } else {
+          const int ukm1 = (k - 1) * Nu;
+          // uk^2
+          for (int i = 0; i < Nu; ++i) Ht.emplace_back(uk + i, uk + i, ws);
+          // ukm1^2
+          for (int i = 0; i < Nu; ++i) Ht.emplace_back(ukm1 + i, ukm1 + i, ws);
+          // cross -ws
+          for (int i = 0; i < Nu; ++i) {
+            Ht.emplace_back(uk + i, ukm1 + i, -ws);
+            Ht.emplace_back(ukm1 + i, uk + i, -ws);
+          }
+        }
+      }
+    }
+
+    // Nullspace preference: sum_k u_k^T (N^T R_null N) u_k
+    const double wn = params_.w_null;
+    Eigen::Matrix<double, 7, 7> Nw = Nproj.transpose() * params_.R_null * Nproj;
+    if (wn > 0.0) {
+      for (int k = 0; k < Nt; ++k) {
+        const int uk = k * Nu;
+        for (int r = 0; r < Nu; ++r) {
+          for (int c = 0; c < Nu; ++c) {
+            const double v = wn * Nw(r,c);
+            if (std::abs(v) > 0.0) Ht.emplace_back(uk + r, uk + c, v);
+          }
+        }
+      }
+    }
+
+    // Regularize
+    for (int i = 0; i < nvar; ++i) Ht.emplace_back(i, i, 1e-9);
+
+    qp.H.resize(nvar, nvar);
+    qp.H.setFromTriplets(Ht.begin(), Ht.end());
+
+    // --------- Secondary constraints: deviation box + bounds ---------
+    std::vector<Eigen::Triplet<double>> At;
+    At.reserve(static_cast<size_t>(ncon * 2));
+    qp.l = Eigen::VectorXd::Constant(ncon, -std::numeric_limits<double>::infinity());
+    qp.u = Eigen::VectorXd::Constant(ncon,  std::numeric_limits<double>::infinity());
+
+    int row = 0;
+    const double delta = fs.deviation_bound;
+
+    // (1) deviation: u <= uref + delta  and u >= uref - delta
+    // We express as two sets:
+    //   +I*u in [-inf, uref+delta]
+    //   -I*u in [-inf, -(uref-delta)]  <=> u >= uref-delta
+    for (int k = 0; k < Nt; ++k) {
+      const int uk = k * Nu;
+      const Eigen::Matrix<double, 7, 1> uref = uref_seq[k];
+
+      // u <= uref + delta
+      for (int i = 0; i < Nu; ++i) At.emplace_back(row + i, uk + i, 1.0);
+      qp.u.segment(row, Nu) = uref.array() + delta;
+      row += Nu;
+
+      // -u <= -(uref - delta)
+      for (int i = 0; i < Nu; ++i) At.emplace_back(row + i, uk + i, -1.0);
+      qp.u.segment(row, Nu) = -(uref.array() - delta);
+      row += Nu;
+    }
+
+    // (2) bounds: umin <= u <= umax (two-sided)
+    for (int k = 0; k < Nt; ++k) {
+      const int uk = k * Nu;
+
+      // +I*u in [umin, umax]
+      for (int i = 0; i < Nu; ++i) At.emplace_back(row + i, uk + i, 1.0);
+      qp.l.segment(row, Nu) = params_.umin;
+      qp.u.segment(row, Nu) = params_.umax;
+      row += Nu;
+
+      // -I*u in [-umax, -umin]  (redundant but matches MATLAB structure)
+      for (int i = 0; i < Nu; ++i) At.emplace_back(row + i, uk + i, -1.0);
+      qp.l.segment(row, Nu) = -params_.umax;
+      qp.u.segment(row, Nu) = -params_.umin;
+      row += Nu;
+    }
+
+    if (row != ncon) {
+      throw std::runtime_error("Secondary QP constraint count mismatch: row != ncon");
+    }
+
+    qp.A.resize(ncon, nvar);
+    qp.A.setFromTriplets(At.begin(), At.end());
+
+    // Fix infeasible rows (if any): l>u
+    for (int i = 0; i < qp.l.size(); ++i) {
+      if (qp.l(i) > qp.u(i)) {
+        qp.l(i) = qp.u(i) - 1e-9;
+      }
+    }
+
+    return qp;
+  }
+
+  // ---------------- Performance degradation (MATLAB style) ----------------
+  double evaluatePerformanceDegradation(const Eigen::Matrix<double, 7, 1>& u_final,
+                                        const Eigen::Matrix<double, 7, 1>& u_primary) const {
+    const double change = (u_final - u_primary).norm();
+    const double max_change = (params_.umax - params_.umin).norm();
+    if (max_change <= 1e-9) return 1.0;
+    double degr = std::min(change / max_change, 1.0);
+    if (change < 0.01) degr = 0.0;
+    return degr;
+  }
+
+  // ---------------- OSQP Solve wrappers ----------------
+  int solveOSQPPrimary(const PrimaryQP& qp, Eigen::VectorXd* sol_x) {
+    if (!sol_x) return -1;
+
+    if (!primary_initialized_) {
+      primary_solver_.settings()->setVerbosity(false);
+      primary_solver_.settings()->setWarmStart(true);
+      primary_solver_.settings()->setMaxIteration(30000);
+      primary_solver_.settings()->setAbsoluteTolerance(1e-5);
+      primary_solver_.settings()->setRelativeTolerance(1e-5);
+      primary_solver_.settings()->setPolish(true);
+
+      primary_solver_.data()->setNumberOfVariables(qp.nvar);
+      primary_solver_.data()->setNumberOfConstraints(qp.ncon);
+      if (!primary_solver_.data()->setHessianMatrix(qp.H)) return -1;
+      if (!primary_solver_.data()->setGradient(qp.g)) return -1;
+      if (!primary_solver_.data()->setLinearConstraintsMatrix(qp.A)) return -1;
+      if (!primary_solver_.data()->setLowerBound(qp.l)) return -1;
+      if (!primary_solver_.data()->setUpperBound(qp.u)) return -1;
+
+      if (!primary_solver_.initSolver()) return -1;
+      primary_initialized_ = true;
+
+      primary_primal_ = Eigen::VectorXd::Zero(qp.nvar);
+      primary_dual_   = Eigen::VectorXd::Zero(qp.ncon);
+    } else {
+      // update QP
+      primary_solver_.updateHessianMatrix(qp.H);
+      primary_solver_.updateGradient(qp.g);
+      primary_solver_.updateLinearConstraintsMatrix(qp.A);
+      primary_solver_.updateBounds(qp.l, qp.u);
+    }
+
+    // warm start
+    if (primary_primal_.size() == qp.nvar) primary_solver_.setWarmStart(primary_primal_);
+    if (primary_dual_.size()   == qp.ncon) primary_solver_.setWarmStartDual(primary_dual_);
+
+    const auto ret = primary_solver_.solveProblem();
+    const int status = static_cast<int>(ret);
+
+    // OsqpEigen returns enum; we map:
+    // 0 = NoError (solved), others are errors.
+    // We'll treat 0 as success (status_val == 1 in MATLAB)
+    if (status == 0) {
+      *sol_x = primary_solver_.getSolution();
+      primary_primal_ = *sol_x;
+      primary_dual_ = primary_solver_.getDualSolution();
+      return 1;
+    } else {
+      // still try to fetch best-effort solution
+      *sol_x = primary_solver_.getSolution();
+      primary_primal_ = *sol_x;
+      primary_dual_ = primary_solver_.getDualSolution();
+      return -1;
     }
   }
 
-  // null preference
-  for (int k=0;k<Nt;k++) {
-    int si = k*Nu;
-    Hd.block(si,si,Nu,Nu) += p_.w_null * Nw;
+  int solveOSQPSecondary(const SecondaryQP& qp, Eigen::VectorXd* sol_x) {
+    if (!sol_x) return -1;
+
+    if (!secondary_initialized_) {
+      secondary_solver_.settings()->setVerbosity(false);
+      secondary_solver_.settings()->setWarmStart(true);
+      secondary_solver_.settings()->setMaxIteration(30000);
+      secondary_solver_.settings()->setAbsoluteTolerance(1e-5);
+      secondary_solver_.settings()->setRelativeTolerance(1e-5);
+      secondary_solver_.settings()->setPolish(true);
+
+      secondary_solver_.data()->setNumberOfVariables(qp.nvar);
+      secondary_solver_.data()->setNumberOfConstraints(qp.ncon);
+      if (!secondary_solver_.data()->setHessianMatrix(qp.H)) return -1;
+      if (!secondary_solver_.data()->setGradient(qp.g)) return -1;
+      if (!secondary_solver_.data()->setLinearConstraintsMatrix(qp.A)) return -1;
+      if (!secondary_solver_.data()->setLowerBound(qp.l)) return -1;
+      if (!secondary_solver_.data()->setUpperBound(qp.u)) return -1;
+
+      if (!secondary_solver_.initSolver()) return -1;
+      secondary_initialized_ = true;
+
+      secondary_primal_ = Eigen::VectorXd::Zero(qp.nvar);
+      secondary_dual_   = Eigen::VectorXd::Zero(qp.ncon);
+    } else {
+      secondary_solver_.updateHessianMatrix(qp.H);
+      secondary_solver_.updateGradient(qp.g);
+      secondary_solver_.updateLinearConstraintsMatrix(qp.A);
+      secondary_solver_.updateBounds(qp.l, qp.u);
+    }
+
+    if (secondary_primal_.size() == qp.nvar) secondary_solver_.setWarmStart(secondary_primal_);
+    if (secondary_dual_.size()   == qp.ncon) secondary_solver_.setWarmStartDual(secondary_dual_);
+
+    const auto ret = secondary_solver_.solveProblem();
+    const int status = static_cast<int>(ret);
+
+    if (status == 0) {
+      *sol_x = secondary_solver_.getSolution();
+      secondary_primal_ = *sol_x;
+      secondary_dual_ = secondary_solver_.getDualSolution();
+      return 1;
+    } else {
+      *sol_x = secondary_solver_.getSolution();
+      secondary_primal_ = *sol_x;
+      secondary_dual_ = secondary_solver_.getDualSolution();
+      return -1;
+    }
   }
 
-  Hd += 1e-6 * Eigen::MatrixXd::Identity(n,n);
+private:
+  mutable std::mutex mutex_;
+  GMPCParams params_;
 
-  Eigen::SparseMatrix<double> P = Hd.sparseView();
+  // OSQP solvers and warm-start caches
+  OsqpEigen::Solver primary_solver_;
+  OsqpEigen::Solver secondary_solver_;
+  bool primary_initialized_ = false;
+  bool secondary_initialized_ = false;
+  Eigen::VectorXd primary_primal_;
+  Eigen::VectorXd primary_dual_;
+  Eigen::VectorXd secondary_primal_;
+  Eigen::VectorXd secondary_dual_;
 
-  // Constraints:
-  // 1) deviation: u_k in [uref_k - delta, uref_k + delta]
-  // 2) bounds: u_k in [umin, umax]
-  // Implement as A = [I; I], l/u stacked
-  const int m = 2*n;
-  Eigen::SparseMatrix<double> A(m,n);
-  std::vector<Eigen::Triplet<double>> tri;
-  tri.reserve(2*n);
-  for (int i=0;i<n;i++) {
-    tri.emplace_back(i,i,1.0);
-    tri.emplace_back(i+n,i,1.0);
-  }
-  A.setFromTriplets(tri.begin(), tri.end());
+  // Jdot estimation
+  bool J_prev_valid_ = false;
+  Eigen::Matrix<double, 6, 7> J_prev_;
 
-  Eigen::VectorXd l = Eigen::VectorXd::Zero(m);
-  Eigen::VectorXd u = Eigen::VectorXd::Zero(m);
+  // last command for cross-cycle constraint
+  Eigen::Matrix<double, 7, 1> last_u_cmd_ = Eigen::Matrix<double, 7, 1>::Zero();
+  bool last_u_prev_valid_ = false;
+};
 
-  const double delta = p_.delta_deviation;
+// ------------------------------ End of file ------------------------------
+//
+// Usage in controller (sketch):
+//   DualLayerGMPC gmpc;
+//   GMPCParams p; ... fill ...
+//   gmpc.setParams(p);
+//
+// In update():
+//   GMPCInput in; fill q,dq, pose, pose_d, Vd, M,coriolis,gravity,J
+//   Eigen::Matrix<double,7,1> u = gmpc.computeTau(in);
+//   Eigen::Matrix<double,7,1> tau_cmd = u + coriolis;  // recommended
+//   tau_cmd = saturateTorqueRate(tau_cmd, tau_J_d);
+//   setCommand(tau_cmd)
+//
+// ----------------------------------------------------------------------------
 
-  for (int k=0;k<Nt;k++) {
-    int si = k*Nu;
-    l.segment(si,Nu) = uref_seq[k].array() - delta;
-    u.segment(si,Nu) = uref_seq[k].array() + delta;
-
-    l.segment(n+si,Nu) = p_.umin;
-    u.segment(n+si,Nu) = p_.umax;
-  }
-
-  // Initialize lower solver if needed
-  if (!lower_initialized_) {
-    solver_lower_.settings()->setWarmStart(true);
-    solver_lower_.settings()->setVerbosity(false);
-    solver_lower_.settings()->setMaxIteration(30000);
-    solver_lower_.settings()->setRelativeTolerance(1e-5);
-    solver_lower_.settings()->setAdaptiveRho(true);
-
-    solver_lower_.data()->setNumberOfVariables(n);
-    solver_lower_.data()->setNumberOfConstraints(m);
-
-    if (!solver_lower_.data()->setHessianMatrix(P)) return false;
-    if (!solver_lower_.data()->setGradient(q)) return false;
-    if (!solver_lower_.data()->setLinearConstraintsMatrix(A)) return false;
-    if (!solver_lower_.data()->setLowerBound(l)) return false;
-    if (!solver_lower_.data()->setUpperBound(u)) return false;
-    if (!solver_lower_.initSolver()) return false;
-
-    lower_initialized_ = true;
-  } else {
-    if (!solver_lower_.updateHessianMatrix(P)) return false;
-    if (!solver_lower_.updateGradient(q)) return false;
-    if (!solver_lower_.updateLinearConstraintsMatrix(A)) return false;
-    if (!solver_lower_.updateBounds(l,u)) return false;
-  }
-
-  auto flag = solver_lower_.solveProblem();
-  if (flag != OsqpEigen::ErrorExitFlag::NoError) {
-    *u_final_first = u_primary_first;
-    return false;
-  }
-
-  Eigen::VectorXd sol = solver_lower_.getSolution();
-  *u_final_first = sol.segment(0,Nu);
-  return true;
-}
-
-// ======== Public computeTauMPC (pure-function style) ========
-
-bool GMPCDualLayer::computeTauMPC(
-    const Eigen::Affine3d& O_T_EE,
-    const Eigen::Matrix<double,7,1>& q,
-    const Eigen::Matrix<double,7,1>& dq,
-    const Eigen::Matrix<double,6,7>& J_in,
-    const Eigen::Matrix<double,6,7>& Jdot_in,
-    const Eigen::Matrix<double,7,7>& M,
-    const Eigen::Matrix<double,7,1>& C,
-    const Eigen::Matrix<double,7,1>& G,
-    const DesiredState13& xd0,
-    Eigen::Matrix<double,7,1>* tau_cmd) {
-
-  if (!solver_initialized_) {
-    if (!initSolver()) return false;
-  }
-
-  // build xd sequence (constant desired across horizon)
-  std::vector<DesiredState13> xd_seq(p_.Nt);
-  for (int k=0;k<p_.Nt;k++) xd_seq[k] = xd0;
-
-  // current ee state
-  Eigen::Vector3d p0 = O_T_EE.translation();
-  Eigen::Quaterniond q0(O_T_EE.linear());
-  q0.normalize();
-
-  // compute current twist V0 = J*dq
-  Eigen::Matrix<double,6,1> V0 = J_in * dq;
-
-  // error state p0 (12x1)
-  Eigen::Matrix<double,12,1> p0_err = calculateErrorVector(xd0, q0, p0, V0);
-
-  // joint coriolis matrix is not available directly from franka model handle;
-  // To keep full Jacobian.cpp structure we pass an approximation:
-  Eigen::Matrix<double,7,7> Cmat = Eigen::Matrix<double,7,7>::Zero();
-  // NOTE: You can replace this with a proper C(q,dq) if you have it elsewhere.
-  // Here we only keep structure; the main feedforward is still handled by C vector outside.
-  (void)C; // silence unused if you keep Cmat = 0.
-
-  // upper QP update
-  updateConstraints(p0_err, xd_seq, M, Cmat, G, J_in, Jdot_in);
-  updateCostFunction(p0_err, xd_seq);
-
-  Eigen::VectorXd full_sol;
-  Eigen::Matrix<double,7,1> u_primary;
-  if (!solveUpperQP(&full_sol, &u_primary)) return false;
-
-  // lower QP
-  Eigen::Matrix<double,7,1> u_final;
-  bool ok_lower = solveSecondaryQP(full_sol, u_primary, u_prev_cycle_, J_in, &u_final);
-  if (!ok_lower) u_final = u_primary;
-
-  // final torque output: u_final + coriolis + gravity (保持你原来 impedance 的结构风格)
-  *tau_cmd = u_final + C + G;
-
-  u_prev_cycle_ = u_final;
-  return true;
-}
-
-} // namespace serl_franka_controllers
+}  // namespace serl_franka_controllers

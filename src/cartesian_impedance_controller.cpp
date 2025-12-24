@@ -212,25 +212,28 @@ void CartesianImpedanceController::update(const ros::Time& time,
                        (nullspace_stiffness_ * qe -
                         (2.0 * sqrt(nullspace_stiffness_)) * dqe);
 
-
-    // ====== Build GMPC inputs ======
+  // ====== Build GMPC inputs ======
   std::array<double, 49> mass_array = model_handle_->getMass();
   std::array<double, 7> gravity_array = model_handle_->getGravity();
 
-  Eigen::Map<Eigen::Matrix<double,7,7>> M(mass_array.data());
-  Eigen::Map<Eigen::Matrix<double,7,1>> G(gravity_array.data());
+  Eigen::Matrix<double, 7, 7> M = Eigen::Map<Eigen::Matrix<double, 7, 7>>(mass_array.data());
+  Eigen::Matrix<double, 7, 1> G = Eigen::Map<Eigen::Matrix<double, 7, 1>>(gravity_array.data());
 
-  // Jdot by discrete difference
-  Eigen::Matrix<double,6,7> Jdot = Eigen::Matrix<double,6,7>::Zero();
+  // dt from real period
   double dt = 0.001;
-  if (period.toSec() > 1e-6) dt = period.toSec();
-  if (J_prev_valid_) {
+  if (period.toSec() > 1e-6)
+    dt = period.toSec();
+
+  // Jdot by discrete difference (optionally filtered)
+  Eigen::Matrix<double, 6, 7> Jdot = Eigen::Matrix<double, 6, 7>::Zero();
+  if (J_prev_valid_)
+  {
     Jdot = (jacobian - J_prev_) / dt;
   }
   J_prev_ = jacobian;
   J_prev_valid_ = true;
 
-  // desired state xd0: [qw qx qy qz px py pz wx wy wz vx vy vz]
+  // desired state
   serl_franka_controllers::DesiredState13 xd0;
   xd0.v.setZero();
   xd0.v(0) = orientation_d_.w();
@@ -240,15 +243,15 @@ void CartesianImpedanceController::update(const ros::Time& time,
   xd0.v(4) = position_d_(0);
   xd0.v(5) = position_d_(1);
   xd0.v(6) = position_d_(2);
-  // desired twist = 0 by default (you can feed a nonzero Vd later)
+  // If you have desired twist, fill xd0.v(7..12) here.
 
-  // update gmpc dt (keep solver internal consistent)
-  gmpc_params_.dt = dt;
-  gmpc_.setParams(gmpc_params_);
+  // DO NOT call setParams every cycle.
+  // Instead: pass dt into computeTauMPC or provide a lightweight setter.
+  // Example: gmpc_.setDt(dt);  (implement this to only update dt)
+  gmpc_.setDt(dt); // <-- you need this method, or change computeTauMPC signature
 
-  Eigen::Matrix<double,7,1> tau_mpc = Eigen::Matrix<double,7,1>::Zero();
+  Eigen::Matrix<double, 7, 1> tau_u = Eigen::Matrix<double, 7, 1>::Zero();
 
-  // IMPORTANT: Use current transform (Eigen::Affine3d transform already built)
   bool ok = gmpc_.computeTauMPC(
       transform,
       q, dq,
@@ -258,23 +261,29 @@ void CartesianImpedanceController::update(const ros::Time& time,
       coriolis,
       G,
       xd0,
-      &tau_mpc);
+      &tau_u);
 
-  // Fallback if MPC fails: keep your impedance torque (original)
-  Eigen::Matrix<double,7,1> tau_d_cmd;
-  if (!ok) {
+  // IMPORTANT CONTRACT:
+  // tau_u is the "control term" (NOT including coriolis).
+  Eigen::Matrix<double, 7, 1> tau_d_cmd;
+  if (!ok)
+  {
+    // fallback to original verified controller
     tau_d_cmd = tau_task + tau_nullspace + coriolis;
-  } else {
-    tau_d_cmd = tau_mpc;
+  }
+  else
+  {
+    // keep original framework: add coriolis compensation here
+    tau_d_cmd = tau_u + coriolis;
   }
 
-  // Saturate torque rate to avoid discontinuities (keep your existing safety)
+  // keep safety
   tau_d_cmd = saturateTorqueRate(tau_d_cmd, tau_J_d);
 
-  for (size_t i = 0; i < 7; ++i) {
+  for (size_t i = 0; i < 7; ++i)
+  {
     joint_handles_[i].setCommand(tau_d_cmd(i));
   }
-
 
   // update parameters changed online either through dynamic reconfigure or through the interactive
   // target by filtering
