@@ -46,7 +46,7 @@ static inline Eigen::Matrix3d skew3(const Eigen::Vector3d& a) {
       -a.y(), a.x(), 0.0;
   return A;
 }
-
+// 666
 // Lie algebra adjoint operator ad_V for a twist V = [w; v] in R^6
 // ad_V = [ [w^, 0],
 //          [v^, w^] ]
