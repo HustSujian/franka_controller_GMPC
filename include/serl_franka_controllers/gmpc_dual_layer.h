@@ -88,21 +88,27 @@ struct GMPCParams {
       0,0,0,0,0,0,0.1).finished();
 
   // second layer: deviation bound (delta_deviation)
-  double delta_deviation = 0.001;   // 你文件里默认 0.001
+  double delta_deviation = 0.001;   // 
   double lambda_dls      = 0.01;    // DLS base
 
-  // performance tolerance (alpha_tolerance) — 你 MATLAB 有，但这里先留接口
+  // performance tolerance (alpha_tolerance) —  MATLAB 有，但这里先留接口
   double alpha_tolerance = 0.95;
 
   GMPCParams() {
     umax << 50, 50, 50, 28, 28, 28, 28;
     umin = -umax;
 
-    // Jacobian.cpp: Q_ / R_ 的量级，我按你文件风格给默认（你要自己调）
+    // Jacobian.cpp: Q_ / R_ 的量级
     Q.setZero();
     Q.block<3,3>(0,0) = 20.0 * Eigen::Matrix3d::Identity();     // rotation err
     Q.block<3,3>(3,3) = 20.0 * Eigen::Matrix3d::Identity();     // translation err
     Q.block<6,6>(6,6) = 800.0 * Eigen::Matrix<double,6,6>::Identity(); // twist (or vel) err part
+
+    // Q = (Eigen::VectorXd(12) <<
+    //  20,20,20,
+    //  520,520,525,
+    //  2,2,2,
+    //  5,5,10).finished().asDiagonal();
 
     R.setZero();
     R.diagonal() << 1e-8,1e-8,1e-8,1e-8,1e-8,1e-8,1e-8;
