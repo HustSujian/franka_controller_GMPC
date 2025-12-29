@@ -144,6 +144,7 @@ void CartesianImpedanceController::starting(const ros::Time& /*time*/) {
 
   gmpc_.reset();
   J_prev_valid_ = false;
+  t_total_ = 0.0;  // 重置时间计数器
 }
 
 void CartesianImpedanceController::update(const ros::Time& time,
@@ -155,7 +156,13 @@ void CartesianImpedanceController::update(const ros::Time& time,
       model_handle_->getZeroJacobian(franka::Frame::kEndEffector);
   publishZeroJacobian(time);
   Eigen::Map<Eigen::Matrix<double, 7, 1>> coriolis(coriolis_array.data());
-  Eigen::Map<Eigen::Matrix<double, 6, 7>> jacobian(jacobian_array.data());
+  Eigen::Map<Eigen::Matrix<double, 6, 7>> jacobian_raw(jacobian_array.data());
+  
+  // 雅可比矩阵顺序调整：Franka原始顺序为[线速度3行; 角速度3行]
+  // GMPC需要的顺序：[角速度3行; 线速度3行]（与Jacobian.cpp一致）
+  Eigen::Matrix<double, 6, 7> jacobian;
+  jacobian.block<3, 7>(0, 0) = jacobian_raw.block<3, 7>(3, 0);  // 角速度放到前3行
+  jacobian.block<3, 7>(3, 0) = jacobian_raw.block<3, 7>(0, 0);  // 线速度放到后3行
   Eigen::Map<Eigen::Matrix<double, 7, 1>> q(robot_state.q.data());
   Eigen::Map<Eigen::Matrix<double, 7, 1>> dq(robot_state.dq.data());
   Eigen::Map<Eigen::Matrix<double, 7, 1>> tau_J_d(  // NOLINT (readability-identifier-naming)
@@ -213,18 +220,26 @@ void CartesianImpedanceController::update(const ros::Time& time,
                         (2.0 * sqrt(nullspace_stiffness_)) * dqe);
 
   // ====== Build GMPC inputs ======
-  std::array<double, 49> mass_array = model_handle_->getMass();
-  std::array<double, 7> gravity_array = model_handle_->getGravity();
+  // 获取Franka动力学参数（通过 franka_hw::FrankaModelHandle）
+  // 与 Jacobian.cpp 不同：
+  //   - Jacobian.cpp 使用 Pinocchio: computeMinverse(), computeCoriolisMatrix(), computeGeneralizedGravity()
+  //   - 本代码使用 franka_ros: model_handle_->getMass(), getCoriolis(), getGravity()
+  // 优点：franka_ros 提供的参数基于真实机器人标定，精度更高
+  std::array<double, 49> mass_array = model_handle_->getMass();       // 7x7 质量矩阵 M(q)
+  std::array<double, 7> gravity_array = model_handle_->getGravity();  // 7x1 重力向量 G(q)
 
   Eigen::Matrix<double, 7, 7> M = Eigen::Map<Eigen::Matrix<double, 7, 7>>(mass_array.data());
   Eigen::Matrix<double, 7, 1> G = Eigen::Map<Eigen::Matrix<double, 7, 1>>(gravity_array.data());
 
-  // dt from real period
+  // 获取实际控制周期
   double dt = 0.001;
-  if (period.toSec() > 1e-6)
+  if (period.toSec() > 1e-6 && period.toSec() < 0.1)
     dt = period.toSec();
 
-  // Jdot by discrete difference (optionally filtered)
+  // 计算Jdot（有限差分法）
+  // 注意：Franka 不提供 Jdot 接口，也不支持 Pinocchio
+  // Jacobian.cpp 使用：pinocchio::computeJointJacobiansTimeVariation(model, data, q, dq)
+  // 这里使用有限差分：Jdot ≈ (J_current - J_prev) / dt
   Eigen::Matrix<double, 6, 7> Jdot = Eigen::Matrix<double, 6, 7>::Zero();
   if (J_prev_valid_)
   {
@@ -233,53 +248,107 @@ void CartesianImpedanceController::update(const ros::Time& time,
   J_prev_ = jacobian;
   J_prev_valid_ = true;
 
-  // desired state
+  // 构造期望状态（13维：[qw qx qy qz px py pz wx wy wz vx vy vz]）
   serl_franka_controllers::DesiredState13 xd0;
   xd0.v.setZero();
-  xd0.v(0) = orientation_d_.w();
-  xd0.v(1) = orientation_d_.x();
-  xd0.v(2) = orientation_d_.y();
-  xd0.v(3) = orientation_d_.z();
-  xd0.v(4) = position_d_(0);
-  xd0.v(5) = position_d_(1);
-  xd0.v(6) = position_d_(2);
-  // If you have desired twist, fill xd0.v(7..12) here.
+  
+  if (use_trajectory_) {
+    // 使用螺旋轨迹生成（参考 Jacobian.cpp）
+    // 注意：这里的轨迹生成函数在 gmpc_dual_layer.cpp 中是 static 的
+    // 因此我们在这里直接计算当前期望状态
+    double T = 30.0;  // 总周期
+    double t_in_period = std::fmod(t_total_, T);
+    
+    double radius = 0.4;
+    double height = 0.2;
+    double turns = 0.6;
+    double t_end = 30.0;
+    
+    // 位置（螺旋轨迹）
+    double x = radius * std::cos(2 * M_PI * turns * t_in_period / t_end);
+    double y = 0 + radius * std::sin(2 * M_PI * turns * t_in_period / t_end);
+    double z = 0.9 + height * t_in_period / t_end;
+    
+    // 速度
+    double x_d = -radius * (2 * M_PI * turns) / t_end * std::sin(2 * M_PI * turns * t_in_period / t_end);
+    double y_d =  radius * (2 * M_PI * turns) / t_end * std::cos(2 * M_PI * turns * t_in_period / t_end);
+    double z_d = height / t_end;
+    
+    // 四元数（保持恒定姿态）
+    Eigen::Vector4d q0(0.6, 0, 0, 0.8);
+    q0.normalize();
+    
+    xd0.v(0) = q0(0);  // qw
+    xd0.v(1) = q0(1);  // qx
+    xd0.v(2) = q0(2);  // qy
+    xd0.v(3) = q0(3);  // qz
+    xd0.v(4) = x;      // px
+    xd0.v(5) = y;      // py
+    xd0.v(6) = z;      // pz
+    xd0.v(7) = 0;      // wx
+    xd0.v(8) = 0;      // wy
+    xd0.v(9) = 0;      // wz
+    xd0.v(10) = x_d;   // vx
+    xd0.v(11) = y_d;   // vy
+    xd0.v(12) = z_d;   // vz
+    
+    ROS_INFO_THROTTLE(2.0, "Trajectory mode | t=%.2f | pos=[%.3f, %.3f, %.3f] | vel=[%.3f, %.3f, %.3f]",
+                      t_in_period, x, y, z, x_d, y_d, z_d);
+  } else {
+    // 固定点跟踪模式
+    xd0.v(0) = orientation_d_.w();
+    xd0.v(1) = orientation_d_.x();
+    xd0.v(2) = orientation_d_.y();
+    xd0.v(3) = orientation_d_.z();
+    xd0.v(4) = position_d_(0);
+    xd0.v(5) = position_d_(1);
+    xd0.v(6) = position_d_(2);
+    // xd0.v(7..12) = 0 (已经通过 setZero() 设置)
+  }
 
-  // DO NOT call setParams every cycle.
-  // Instead: pass dt into computeTauMPC or provide a lightweight setter.
-  // Example: gmpc_.setDt(dt);  (implement this to only update dt)
-  gmpc_.setDt(dt); // <-- you need this method, or change computeTauMPC signature
+  // 更新GMPC时间步长
+  gmpc_.setDt(dt);
 
+  // 调用GMPC求解器
   Eigen::Matrix<double, 7, 1> tau_u = Eigen::Matrix<double, 7, 1>::Zero();
-
   bool ok = gmpc_.computeTauMPC(
-      transform,
-      q, dq,
-      jacobian,
-      Jdot,
-      M,
-      coriolis,
-      G,
-      xd0,
-      &tau_u);
+      transform,    // 当前末端位姿
+      q, dq,        // 关节位置和速度
+      jacobian,     // 雅可比矩阵
+      Jdot,         // 雅可比导数
+      M,            // 质量矩阵
+      coriolis,     // 科氏力+重力（Franka的coriolis已包含重力）
+      G,            // 重力向量（单独传递用于GMPC内部计算）
+      xd0,          // 期望状态
+      &tau_u);      // 输出：控制力矩（不含补偿项）
 
-  // IMPORTANT CONTRACT:
-  // tau_u is the "control term" (NOT including coriolis).
+  // 组装最终控制指令
   Eigen::Matrix<double, 7, 1> tau_d_cmd;
   if (!ok)
   {
-    // fallback to original verified controller
+    // GMPC求解失败，降级到原阻抗控制器
+    ROS_WARN_THROTTLE(1.0, "GMPC solver failed, using fallback impedance control");
     tau_d_cmd = tau_task + tau_nullspace + coriolis;
   }
   else
   {
-    // keep original framework: add coriolis compensation here
+    // GMPC成功，使用GMPC输出
+    // 注意：tau_u是纯控制项，需要加上coriolis补偿（包含重力）
     tau_d_cmd = tau_u + coriolis;
+    
+    // 更新时间（用于轨迹生成）
+    t_total_ += dt;
+    
+    // 调试信息（每秒打印一次）
+    ROS_INFO_THROTTLE(1.0, "GMPC active | tau_norm: %.3f | position_error: [%.3f, %.3f, %.3f]",
+                      tau_u.norm(),
+                      error_(0), error_(1), error_(2));
   }
 
-  // keep safety
+  // 力矩变化率限制（安全机制）
   tau_d_cmd = saturateTorqueRate(tau_d_cmd, tau_J_d);
 
+  // 发送控制指令到各关节
   for (size_t i = 0; i < 7; ++i)
   {
     joint_handles_[i].setCommand(tau_d_cmd(i));

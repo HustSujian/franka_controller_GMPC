@@ -54,6 +54,10 @@ class CartesianImpedanceController : public controller_interface::MultiInterface
   Eigen::Matrix<double,6,7> J_prev_ = Eigen::Matrix<double,6,7>::Zero();
   bool J_prev_valid_ = false;
 
+  // 轨迹生成参数
+  double t_total_ = 0.0;           // 总运行时间
+  bool use_trajectory_ = false;    // 是否使用轨迹跟踪（false=固定点）
+
 
   double filter_params_{0.005};
   double nullspace_stiffness_{20.0};
