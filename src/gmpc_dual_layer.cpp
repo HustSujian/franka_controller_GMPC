@@ -1,20 +1,20 @@
 // gmpc_dual_layer.cpp
-// Dual-layer GMPC (Primary tracking + Secondary nullspace/smoothness) for 7-DoF torque control.
-// - Primary QP: tracking in error-state y=[phi; V] with constraints
-// - Secondary QP: within deviation box around primary solution, optimize smoothness + nullspace preference
+// 7 自由度力矩控制的双层 GMPC（主层跟踪 + 副层零空间/平滑度优化）
+// - 主层 QP：在误差状态 y=[phi; V] 上做跟踪并施加约束
+// - 副层 QP：在主解附近的偏差盒中优化平滑度和零空间偏好
 //
-// This implementation is adapted from the uploaded MATLAB "7dof-双层.txt":
+// 此实现参考了上传的 MATLAB 文件 “7dof-双层.txt”：
 //   - solvePrimaryMPC() + buildPrimaryConstraints() + buildPrimaryCost()
-//   - solveSecondaryMPC_Modified() + deviation constraints + smooth + N'RnullN
+//   - solveSecondaryMPC_Modified() + 偏差约束 + 平滑项 + N'RnullN
 //
-// And follows OsqpEigen usage patterns similar to uploaded Jacobian.cpp.
+// 同时遵循了 Jacobian.cpp 中的 OsqpEigen 用法。
 //
-// NOTE (Franka practical):
-// - Franka provides mass matrix M(q), coriolis vector c(q,dq), gravity g(q) via model handle.
-// - Coriolis *matrix* C(q,dq) is not available; Jdot is not directly available either.
-// - We therefore use an affine Vdot model:
+// 注（Franka 实际应用）：
+// - Franka 通过 model handle 提供质量矩阵 M(q)、科里奥利向量 c(q,dq) 与重力 g(q)。
+// - 不提供科里奥利矩阵 C(q,dq)，Jdot 也无法直接获取。
+// - 因此采用仿射的 Vdot 模型：
 //     Vdot = J * M^{-1} * u  +  (Jdot*dq - J*M^{-1}(coriolis+gravity))
-//   and estimate Jdot via finite difference.
+//   并用有限差分估计 Jdot。
 
 #include <OsqpEigen/OsqpEigen.h>
 
@@ -37,7 +37,7 @@
 
 namespace serl_franka_controllers {
 
-// ------------------------------ Utilities ------------------------------
+// ------------------------------ 工具函数 ------------------------------
 
 static inline Eigen::Matrix3d skew3(const Eigen::Vector3d& a) {
   Eigen::Matrix3d A;
@@ -47,9 +47,9 @@ static inline Eigen::Matrix3d skew3(const Eigen::Vector3d& a) {
   return A;
 }
 // 666
-// Lie algebra adjoint operator ad_V for a twist V = [w; v] in R^6
-// ad_V = [ [w^, 0],
-//          [v^, w^] ]
+// 李代数中 twist V = [w; v]（R^6）的伴随算子 ad_V
+// ad_V 的定义： [ [w^, 0],
+//                [v^, w^] ]
 static inline Eigen::Matrix<double, 6, 6> ad6(const Eigen::Matrix<double, 6, 1>& V) {
   const Eigen::Vector3d w = V.template head<3>();
   const Eigen::Vector3d v = V.template tail<3>();
@@ -61,7 +61,7 @@ static inline Eigen::Matrix<double, 6, 6> ad6(const Eigen::Matrix<double, 6, 1>&
   return ad;
 }
 
-// Damped pseudoinverse of J (6x7): J^T (J J^T + lambda^2 I)^-1
+// J (6x7) 的阻尼伪逆：J^T (J J^T + lambda^2 I)^-1
 static inline Eigen::Matrix<double, 7, 6> dampedPinvJT(
     const Eigen::Matrix<double, 6, 7>& J, double lambda) {
   Eigen::Matrix<double, 6, 6> JJt = J * J.transpose();
@@ -70,7 +70,7 @@ static inline Eigen::Matrix<double, 7, 6> dampedPinvJT(
   return Jinv;
 }
 
-// Compute condition number approx for J using SVD
+// 利用 SVD 近似计算 J 的条件数
 static inline double condNumber(const Eigen::Matrix<double, 6, 7>& J) {
   Eigen::JacobiSVD<Eigen::MatrixXd> svd(J, Eigen::ComputeThinU | Eigen::ComputeThinV);
   const auto& s = svd.singularValues();
@@ -82,7 +82,7 @@ static inline double condNumber(const Eigen::Matrix<double, 6, 7>& J) {
 }
 
 static inline double manipulabilityMeasure(const Eigen::Matrix<double, 6, 7>& J) {
-  // sqrt(det(J J^T)) can be computed via SVD: product of singular values
+  // sqrt(det(J J^T)) 可用 SVD 的奇异值乘积计算
   Eigen::JacobiSVD<Eigen::MatrixXd> svd(J, Eigen::ComputeThinU | Eigen::ComputeThinV);
   const auto& s = svd.singularValues();
   double prod = 1.0;
@@ -90,17 +90,16 @@ static inline double manipulabilityMeasure(const Eigen::Matrix<double, 6, 7>& J)
   return prod;
 }
 
-// SE(3) log: input T in SE(3), output 4x4 matrix in se(3)
-// We use Eigen's matrix log for simplicity (works for general matrices).
-// Then extract phi as in MATLAB:
-//   w = [X0(3,2); X0(1,3); X0(2,1)]   (1-indexed)
+// SE(3) 对数：输入 T ∈ SE(3)，输出 se(3) 的 4x4 矩阵
+// 这里直接用 Eigen 的矩阵对数（对一般矩阵亦可），再按 MATLAB 取 phi：
+//   w = [X0(3,2); X0(1,3); X0(2,1)]   （1 基索引）
 //   p = X0(1:3,4)
 static inline Eigen::Matrix<double, 6, 1> se3LogPhi(const Eigen::Matrix4d& T_err) {
-  Eigen::Matrix4d X0 = T_err.log();  // requires MatrixFunctions
+  Eigen::Matrix4d X0 = T_err.log();  // 依赖 MatrixFunctions 模块
   Eigen::Matrix<double, 6, 1> phi;
-  phi(0) = X0(2,1);  // (3,2) in MATLAB
-  phi(1) = X0(0,2);  // (1,3)
-  phi(2) = X0(1,0);  // (2,1)
+  phi(0) = X0(2,1);  // MATLAB 中的 (3,2)
+  phi(1) = X0(0,2);  // MATLAB 中的 (1,3)
+  phi(2) = X0(1,0);  // MATLAB 中的 (2,1)
   phi(3) = X0(0,3);
   phi(4) = X0(1,3);
   phi(5) = X0(2,3);
@@ -114,7 +113,7 @@ static inline Eigen::Matrix4d poseToT(const Eigen::Quaterniond& q, const Eigen::
   return T;
 }
 
-// Convert dense to sparse (row-major build)
+// 稠密矩阵转稀疏矩阵（行优先构造）
 static inline Eigen::SparseMatrix<double> denseToSparse(const Eigen::MatrixXd& D, double prune_eps = 0.0) {
   Eigen::SparseMatrix<double> S(D.rows(), D.cols());
   std::vector<Eigen::Triplet<double>> trips;
@@ -148,41 +147,40 @@ static inline void addIdentityTriplets(std::vector<Eigen::Triplet<double>>& T,
   }
 }
 
-// ------------------------------ Parameters ------------------------------
+// ------------------------------ 参数定义 ------------------------------
 
 struct GMPCParams {
-  // Dimensions (fixed for this implementation)
-  static constexpr int Nx = 12;  // state: [phi(6); V(6)]
-  static constexpr int Nu = 7;   // control: joint torques (or torque control term)
-  int Nt = 10;                   // horizon length
-  double dt = 0.001;             // controller dt (should match Franka loop)
+  // 维度（本实现固定）
+  static constexpr int Nx = 12;  // 状态: [phi(6); V(6)]
+  static constexpr int Nu = 7;   // 控制: 关节力矩（或力矩控制项）
+  int Nt = 10;                   // 预测时域长度
+  double dt = 0.001;             // 控制周期，应与 Franka 回路一致
 
-  // Weights (Primary)
+  // 主层代价权重
   Eigen::Matrix<double, 12, 12> Q = Eigen::Matrix<double, 12, 12>::Identity();
   Eigen::Matrix<double, 12, 12> P = Eigen::Matrix<double, 12, 12>::Identity();
   Eigen::Matrix<double, 7, 7>  R = 1e-8 * Eigen::Matrix<double, 7, 7>::Identity();
 
-  // Optional delta-u weight for Primary (like MATLAB param.R_delta)
+  // 可选的主层 Δu 权重（类似 MATLAB 的 param.R_delta）
   bool use_R_delta = false;
   Eigen::Matrix<double, 7, 7> R_delta = Eigen::Matrix<double, 7, 7>::Zero();
   Eigen::Matrix<double, 7, 7> R_cross = Eigen::Matrix<double, 7, 7>::Zero();
 
-  // Control bounds
+  // 控制输入约束
   Eigen::Matrix<double, 7, 1> umin = (-50.0) * Eigen::Matrix<double, 7, 1>::Ones();
   Eigen::Matrix<double, 7, 1> umax = ( 50.0) * Eigen::Matrix<double, 7, 1>::Ones();
 
-  // Hard torque change bounds within horizon (|u_k - u_{k-1}| <= max)
+  // 时域内的力矩变化硬约束 (|u_k - u_{k-1}| <= max)
   Eigen::Matrix<double, 7, 1> du_max = (20.0) * Eigen::Matrix<double, 7, 1>::Ones();
 
-  // Cross-cycle first-step change bound around u_prev
+  // 跨周期首步的力矩变化约束（围绕上一周期 u_prev）
   Eigen::Matrix<double, 7, 1> du_cross_max = (10.0) * Eigen::Matrix<double, 7, 1>::Ones();
 
-  // State bounds (error bounds)
-  // Following MATLAB style, but you should tune to your application.
+  // 状态（误差）约束，风格参考 MATLAB，具体数值可按应用调节
   Eigen::Matrix<double, 12, 1> xmin = (-10.0) * Eigen::Matrix<double, 12, 1>::Ones();
   Eigen::Matrix<double, 12, 1> xmax = ( 10.0) * Eigen::Matrix<double, 12, 1>::Ones();
 
-  // "Actual" pose error bounds around target (position/orientation/velocity)
+  // 相对于目标的实际位姿误差约束（位置/姿态/速度）
   Eigen::Matrix<double, 3, 1> xmin_rot = (-10.0) * Eigen::Matrix<double, 3, 1>::Ones();
   Eigen::Matrix<double, 3, 1> xmax_rot = ( 10.0) * Eigen::Matrix<double, 3, 1>::Ones();
 
@@ -192,42 +190,42 @@ struct GMPCParams {
   Eigen::Matrix<double, 6, 1> xmin_vel = (-2.0) * Eigen::Matrix<double, 6, 1>::Ones();
   Eigen::Matrix<double, 6, 1> xmax_vel = ( 2.0) * Eigen::Matrix<double, 6, 1>::Ones();
 
-  // Secondary layer parameters
+  // 副层参数
   double alpha_tolerance = 0.95;
-  double delta_deviation = 0.001;  // deviation box around primary solution
+  double delta_deviation = 0.001;  // 主层解周围的偏差盒大小
   Eigen::Matrix<double, 7, 7> R_null = Eigen::Matrix<double, 7, 7>::Identity();
   double w_smooth = 1e-8;
   double w_null = 1e-6;
 };
 
-// ------------------------------ IO struct ------------------------------
+// ------------------------------ 输入结构体 ------------------------------
 
 struct GMPCInput {
-  // Current robot state
+  // 当前机器人状态
   Eigen::Matrix<double, 7, 1> q;
   Eigen::Matrix<double, 7, 1> dq;
 
-  // Current EE pose in base frame (O frame in Franka)
+  // 基座坐标系（Franka 的 O 框架）下的末端位姿
   Eigen::Quaterniond orientation;
   Eigen::Vector3d position;
 
-  // Desired EE pose
+  // 期望末端位姿
   Eigen::Quaterniond orientation_d;
   Eigen::Vector3d position_d;
 
-  // Desired twist Vd in base frame (6x1)
+  // 基座系的期望 twist Vd（6x1）
   Eigen::Matrix<double, 6, 1> Vd;
 
-  // Model terms
+  // 模型项
   Eigen::Matrix<double, 7, 7> M;
   Eigen::Matrix<double, 7, 1> coriolis;
   Eigen::Matrix<double, 7, 1> gravity;
 
-  // Jacobian (base frame) and optional Jdot estimate if you have it
+  // 基座系雅可比及可选的 Jdot 估计
   Eigen::Matrix<double, 6, 7> J;
 };
 
-// ------------------------------ Dual-layer GMPC Solver ------------------------------
+// ------------------------------ 双层 GMPC 求解器 ------------------------------
 
 class DualLayerGMPC {
 public:
@@ -254,16 +252,16 @@ public:
     last_u_prev_valid_ = false;
   }
 
-  // Main entry: compute torque control term u (7x1).
-  // Recommended usage in CartesianImpedanceController:
+  // 主入口：计算力矩控制项 u（7x1）。
+  // 在 CartesianImpedanceController 中的推荐用法：
   //   u = gmpc.computeTau(in);
-  //   tau_cmd = u + coriolis; (and then saturateTorqueRate)
+  //   tau_cmd = u + coriolis; （随后再做力矩变化率饱和）
   Eigen::Matrix<double, 7, 1> computeTau(const GMPCInput& in) {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // ----------- Build p0 (initial state) = [phi; V_current] -----------
-    // MATLAB: X00 = X00^{-1} * Xd; X0 = logm(X00); phi from X0, then append x0(8:end) as current twist.
-    // Here: phi = log( T_cur^{-1} T_des ), and V_current = J * dq
+    // ----------- 构造 p0（初始状态） = [phi; V_current] -----------
+    // MATLAB: X00 = X00^{-1} * Xd; X0 = logm(X00); phi 来自 X0，再拼上当前 twist x0(8:end)。
+    // 此处：phi = log( T_cur^{-1} T_des )，V_current = J * dq
     const Eigen::Matrix4d T_cur = poseToT(in.orientation, in.position);
     const Eigen::Matrix4d T_des = poseToT(in.orientation_d, in.position_d);
     const Eigen::Matrix4d T_err = T_cur.inverse() * T_des;
@@ -274,12 +272,12 @@ public:
     Eigen::Matrix<double, 12, 1> p0;
     p0 << phi, V_cur;
 
-    // Desired twist trajectory over horizon: we follow MATLAB xid(k,:) = desired twist samples.
-    // Here we keep it constant for the horizon (can be replaced by a provided buffer).
+    // 预测时域的期望 twist 轨迹：沿用 MATLAB xid(k,:) = 期望 twist 样本。
+    // 这里简化为时域内常值，可替换为外部提供的序列。
     std::vector<Eigen::Matrix<double, 6, 1>> Vd_seq(params_.Nt);
     for (int k = 0; k < params_.Nt; ++k) Vd_seq[k] = in.Vd;
 
-    // ----------- Adaptive damping & nullspace projector N -----------
+    // ----------- 自适应阻尼与零空间投影 N -----------
     const double condJ = condNumber(in.J);
     const double manip = manipulabilityMeasure(in.J);
 
@@ -297,7 +295,7 @@ public:
     const Eigen::Matrix<double, 7, 6> J_pinv = dampedPinvJT(in.J, lambda);
     const Eigen::Matrix<double, 7, 7> Nproj = Eigen::Matrix<double, 7, 7>::Identity() - J_pinv * in.J;
 
-    // ----------- Primary layer solve -----------
+    // ----------- 主层求解 -----------
     Eigen::VectorXd sol1_x;
     int status1 = 0;
     Eigen::Matrix<double, 7, 1> u_primary = Eigen::Matrix<double, 7, 1>::Zero();
@@ -306,27 +304,27 @@ public:
       PrimaryQP qp1 = buildPrimaryQP(in, p0, Vd_seq);
       status1 = solveOSQPPrimary(qp1, &sol1_x);
       if (status1 == 1 && sol1_x.size() == qp1.nvar) {
-        // Extract u_primary = first control at time k=0
+        // 取 u_primary = k=0 时刻的第一个控制量
         const int state_vars = (params_.Nt + 1) * GMPCParams::Nx;
         u_primary = sol1_x.segment(state_vars, GMPCParams::Nu);
       } else {
-        // Fallback: if primary fails, output zero control term
+        // 回退：主层失败则输出零控制
         u_primary.setZero();
-        // Still update last command for continuity
+        // 仍然记录 last_u_cmd_ 以保持连续性
         last_u_cmd_ = u_primary;
         last_u_prev_valid_ = true;
         return u_primary;
       }
     }
 
-    // ----------- Build feasible set for secondary -----------
+    // ----------- 构建副层可行集 -----------
     FeasibleSet fs;
     fs.full_solution = sol1_x;
     fs.u_primary_first = u_primary;
     fs.alpha = params_.alpha_tolerance;
     fs.deviation_bound = params_.delta_deviation;
 
-    // ----------- Secondary layer solve -----------
+    // ----------- 副层求解 -----------
     Eigen::Matrix<double, 7, 1> u_final = u_primary;
     int status2 = 0;
     Eigen::VectorXd sol2_x;
@@ -336,12 +334,12 @@ public:
       status2 = solveOSQPSecondary(qp2, &sol2_x);
 
       if (status2 == 1 && sol2_x.size() == qp2.nvar) {
-        // sol2 is stacked [u0; u1; ... u_{Nt-1}] (Nu*Nt)
+        // sol2 形如 [u0; u1; ... u_{Nt-1}]（Nu*Nt）
         u_final = sol2_x.segment(0, GMPCParams::Nu);
-        // performance degradation check (same idea as MATLAB)
+        // 性能下降检查（同 MATLAB 思路）
         const double degr = evaluatePerformanceDegradation(u_final, u_primary);
         if (degr > (1.0 - fs.alpha)) {
-          // too much degradation -> keep primary
+          // 下降过大则保留主层解
           u_final = u_primary;
         }
       } else {
@@ -354,12 +352,12 @@ public:
     return u_final;
   }
 
-  // Provide last command for cross-cycle constraint
+  // 提供上一周期控制量，用于跨周期约束
   bool hasLastU() const { return last_u_prev_valid_; }
   Eigen::Matrix<double, 7, 1> lastU() const { return last_u_cmd_; }
 
 private:
-  // ---------------- Primary QP container ----------------
+  // ---------------- 主层 QP 容器 ----------------
   struct PrimaryQP {
     int nvar = 0;
     int ncon = 0;
@@ -370,7 +368,7 @@ private:
     Eigen::VectorXd u;
   };
 
-  // ---------------- Secondary QP container ----------------
+  // ---------------- 副层 QP 容器 ----------------
   struct SecondaryQP {
     int nvar = 0;
     int ncon = 0;
@@ -382,13 +380,13 @@ private:
   };
 
   struct FeasibleSet {
-    Eigen::VectorXd full_solution;          // full primary solution
+    Eigen::VectorXd full_solution;          // 主层完整解
     Eigen::Matrix<double, 7, 1> u_primary_first;
     double alpha = 0.95;
     double deviation_bound = 0.001;
   };
 
-  // Build Jdot estimate
+  // 估计 Jdot
   Eigen::Matrix<double, 6, 7> estimateJdot(const Eigen::Matrix<double, 6, 7>& J, double dt) {
     Eigen::Matrix<double, 6, 7> Jdot = Eigen::Matrix<double, 6, 7>::Zero();
     if (J_prev_valid_) {
@@ -399,7 +397,7 @@ private:
     return Jdot;
   }
 
-  // ---------------- Primary QP build ----------------
+  // ---------------- 构建主层 QP ----------------
   PrimaryQP buildPrimaryQP(const GMPCInput& in,
                            const Eigen::Matrix<double, 12, 1>& p0,
                            const std::vector<Eigen::Matrix<double, 6, 1>>& Vd_seq) {
@@ -408,16 +406,16 @@ private:
     const int Nt = params_.Nt;
     const double dt = params_.dt;
 
-    // Variables: X(0..Nt) (Nx*(Nt+1)) + U(0..Nt-1) (Nu*Nt)
+    // 变量：X(0..Nt) (Nx*(Nt+1)) + U(0..Nt-1) (Nu*Nt)
     const int nvar = Nx * (Nt + 1) + Nu * Nt;
 
-    // Constraint blocks:
-    // 1) Dynamics: Nx*Nt
-    // 2) Initial state: Nx
-    // 3) State bounds for k=1..Nt: Nx*Nt
-    // 4) Control bounds: Nu*Nt
-    // 5) Cross-cycle first-step change: Nu (if last_u exists)
-    // 6) Hard delta-u within horizon: Nu*(Nt-1)
+    // 约束块：
+    // 1) 动力学：Nx*Nt
+    // 2) 初始状态：Nx
+    // 3) 状态约束 k=1..Nt：Nx*Nt
+    // 4) 控制约束：Nu*Nt
+    // 5) 跨周期首步变化：Nu（若存在 last_u）
+    // 6) 时域内 Δu 硬约束：Nu*(Nt-1)
     const bool has_prev = last_u_prev_valid_;
     const int ncon =
         (Nx * Nt) + Nx + (Nx * Nt) + (Nu * Nt) + (has_prev ? Nu : 0) + (Nu * (Nt - 1));
@@ -426,17 +424,17 @@ private:
     qp.nvar = nvar;
     qp.ncon = ncon;
 
-    // --------- Build H and g (cost) ---------
-    // Following MATLAB buildPrimaryCost():
-    // For k=1..Nt:
+    // --------- 组装 H 与 g（代价） ---------
+    // 对应 MATLAB buildPrimaryCost():
+    // 对 k=1..Nt:
     //   C = I; C(7:12,1:6) = -ad(Vd_k)
-    //   b = [0; Vd_k] used to form q linear term: -C'Q b
-    //   State block: C'Q C (or C'P C at final)
-    // Control block: R (and optional delta-u)
+    //   b = [0; Vd_k] 用于线性项 q: -C'Q b
+    //   状态块: C'Q C（末尾用 C'P C）
+    // 控制块: R（可选 Δu）
     //
-    // We'll build sparse using triplets.
+    // 使用三元组构建稀疏矩阵。
     std::vector<Eigen::Triplet<double>> Ht;
-    Ht.reserve(static_cast<size_t>(nvar * 5));  // rough
+    Ht.reserve(static_cast<size_t>(nvar * 5));  // 粗略预估容量
 
     qp.g = Eigen::VectorXd::Zero(nvar);
 
@@ -451,19 +449,19 @@ private:
       bvec.segment<6>(6) = Vd_seq[std::min(k-1, Nt-1)];
       Eigen::Matrix<double, 12, 1> gblk = -Cmap.transpose() * W * bvec;
 
-      const int idx0 = k * Nx;  // X_k starts at k*Nx
-      // H block
+      const int idx0 = k * Nx;  // X_k 起始索引 k*Nx
+      // H 块
       for (int r = 0; r < Nx; ++r) {
         for (int c = 0; c < Nx; ++c) {
           const double v = Hblk(r,c);
           if (std::abs(v) > 0.0) Ht.emplace_back(idx0 + r, idx0 + c, v);
         }
       }
-      // g block
+      // g 块
       qp.g.segment(idx0, Nx) += gblk;
     }
 
-    // Control cost: block diagonal R over U sequence
+    // 控制代价：U 序列上块对角的 R
     const int u_offset = Nx * (Nt + 1);
     for (int k = 0; k < Nt; ++k) {
       const int uk = u_offset + k * Nu;
@@ -475,7 +473,7 @@ private:
       }
     }
 
-    // Optional delta-u cost (like MATLAB)
+    // 可选 Δu 代价（与 MATLAB 一致）
     if (params_.use_R_delta) {
       for (int k = 0; k < Nt; ++k) {
         const int uk = u_offset + k * Nu;
@@ -493,21 +491,21 @@ private:
         } else {
           // (uk - u_{k-1})^T R_delta (uk - u_{k-1})
           const int ukm1 = u_offset + (k - 1) * Nu;
-          // uk^T R uk
+          // uk^T R uk 项
           for (int r = 0; r < Nu; ++r) {
             for (int c = 0; c < Nu; ++c) {
               const double v = params_.R_delta(r,c);
               if (std::abs(v) > 0.0) Ht.emplace_back(uk + r, uk + c, v);
             }
           }
-          // u_{k-1}^T R u_{k-1}
+          // u_{k-1}^T R u_{k-1} 项
           for (int r = 0; r < Nu; ++r) {
             for (int c = 0; c < Nu; ++c) {
               const double v = params_.R_delta(r,c);
               if (std::abs(v) > 0.0) Ht.emplace_back(ukm1 + r, ukm1 + c, v);
             }
           }
-          // cross terms -R
+          // 交叉项 -R
           for (int r = 0; r < Nu; ++r) {
             for (int c = 0; c < Nu; ++c) {
               const double v = -params_.R_delta(r,c);
@@ -521,7 +519,7 @@ private:
       }
     }
 
-    // Regularize to ensure PSD
+    // 对角正则化以保证半正定
     for (int i = 0; i < nvar; ++i) {
       Ht.emplace_back(i, i, 1e-9);
     }
@@ -529,7 +527,7 @@ private:
     qp.H.resize(nvar, nvar);
     qp.H.setFromTriplets(Ht.begin(), Ht.end());
 
-    // --------- Build constraints A, l, u ---------
+    // --------- 组装约束 A, l, u ---------
     std::vector<Eigen::Triplet<double>> At;
     At.reserve(static_cast<size_t>(ncon * 10));
     qp.l = Eigen::VectorXd::Constant(ncon, -std::numeric_limits<double>::infinity());
@@ -537,8 +535,8 @@ private:
 
     int row = 0;
 
-    // (1) Dynamics constraints: X_{k+1} = Ad X_k + Bd u_k + hd
-    // MATLAB buildPrimaryConstraints used:
+    // (1) 动力学约束：X_{k+1} = Ad X_k + Bd u_k + hd
+    // MATLAB buildPrimaryConstraints 形式：
     //  Ac = [ -ad(Vd), -I;
     //         0,       H ]
     //  Bc = [ 0;
@@ -546,15 +544,15 @@ private:
     //  hc = [ Vd;
     //         b ]
     //
-    // Here we use practical affine model:
+    // 这里使用实际可获得的仿射模型：
     //  phi_dot = -ad(Vd)*phi + V - Vd
     //  V_dot   = J*M^{-1}*u + (Jdot*dq - J*M^{-1}(coriolis+gravity))
     //
-    // so:
+    // 因此：
     //  d/dt [phi] = (-ad(Vd))*phi + I*V + (-I)*Vd
     //  d/dt [V]   = 0*phi + 0*V + (J*M^{-1})*u + b_aff
     //
-    // Discretize:
+    // 离散化：
     //  X_{k+1} = (I + Ac dt) X_k + (Bc dt) u_k + (hc dt)
     //
     const Eigen::Matrix<double, 7, 7> Minv = in.M.inverse();
@@ -573,7 +571,7 @@ private:
       Eigen::Matrix<double, 12, 12> Ac = Eigen::Matrix<double, 12, 12>::Zero();
       Ac.block<6,6>(0,0) = -ad6(Vd);
       Ac.block<6,6>(0,6) = -Eigen::Matrix<double,6,6>::Identity();
-      // V dynamics: no dependence on phi,V in this practical form (can be extended)
+      // V 的动力学在此简化模型中与 phi、V 无耦合（如需可扩展）
       // Ac.block<6,6>(6,0) = 0;
       // Ac.block<6,6>(6,6) = 0;
 
@@ -588,17 +586,17 @@ private:
       Eigen::Matrix<double, 12, 7>  Bd = Bc * dt;
       Eigen::Matrix<double, 12, 1>  hd = hc * dt;
 
-      // Constraint form:
+      // 约束形式：
       //  -Ad * X_k + I * X_{k+1} + (-Bd)*u_k = hd
       const int xk  = k * Nx;
       const int xk1 = (k + 1) * Nx;
       const int uk  = u_offset + k * Nu;
 
-      // -Ad on X_k
+      // X_k 上的 -Ad
       addBlockTriplets(At, row, xk, -Ad, 0.0);
-      // +I on X_{k+1}
+      // X_{k+1} 上的 +I
       addIdentityTriplets(At, row, xk1, Nx, 1.0);
-      // -Bd on u_k
+      // u_k 上的 -Bd
       addBlockTriplets(At, row, uk, -Bd, 0.0);
 
       qp.l.segment(row, Nx) = hd;
@@ -607,7 +605,7 @@ private:
       row += Nx;
     }
 
-    // (2) Initial state: X_0 = p0
+    // (2) 初始状态：X_0 = p0
     {
       addIdentityTriplets(At, row, 0, Nx, 1.0);
       qp.l.segment(row, Nx) = p0;
@@ -615,33 +613,33 @@ private:
       row += Nx;
     }
 
-    // (3) State bounds for k=1..Nt
-    // MATLAB computed bounds relative to target pose:
-    //  rot bounds -> phi(1:3), pos bounds -> phi(4:6), vel bounds -> V(1:6)
+    // (3) 状态约束 k=1..Nt
+    // MATLAB 相对目标位姿的约束：
+    //  rot -> phi(1:3), pos -> phi(4:6), vel -> V(1:6)
     for (int k = 1; k <= Nt; ++k) {
       const int xk = k * Nx;
 
       Eigen::Matrix<double, 12, 1> xmin = Eigen::Matrix<double, 12, 1>::Zero();
       Eigen::Matrix<double, 12, 1> xmax = Eigen::Matrix<double, 12, 1>::Zero();
 
-      // phi bounds
+      // phi 约束
       xmin.segment<3>(0) = params_.xmin_rot;
       xmax.segment<3>(0) = params_.xmax_rot;
       xmin.segment<3>(3) = params_.xmin_pos;
       xmax.segment<3>(3) = params_.xmax_pos;
 
-      // V bounds
+      // V 约束
       xmin.segment<6>(6) = params_.xmin_vel;
       xmax.segment<6>(6) = params_.xmax_vel;
 
-      // Add constraint: xmin <= X_k <= xmax
+      // 约束：xmin <= X_k <= xmax
       addIdentityTriplets(At, row, xk, Nx, 1.0);
       qp.l.segment(row, Nx) = xmin;
       qp.u.segment(row, Nx) = xmax;
       row += Nx;
     }
 
-    // (4) Control bounds for k=0..Nt-1: umin <= u_k <= umax
+    // (4) 控制约束 k=0..Nt-1：umin <= u_k <= umax
     for (int k = 0; k < Nt; ++k) {
       const int uk = u_offset + k * Nu;
       addIdentityTriplets(At, row, uk, Nu, 1.0);
@@ -650,7 +648,7 @@ private:
       row += Nu;
     }
 
-    // (5) Cross-cycle first-step change around last_u_cmd_
+    // (5) 跨周期首步变化围绕 last_u_cmd_
     if (has_prev) {
       const int u0 = u_offset + 0 * Nu;
       addIdentityTriplets(At, row, u0, Nu, 1.0);
@@ -659,15 +657,14 @@ private:
       row += Nu;
     }
 
-    // (6) Hard delta-u within horizon: |u_k - u_{k-1}| <= du_max, for k=1..Nt-1
+    // (6) 时域内 Δu 约束：|u_k - u_{k-1}| <= du_max，k=1..Nt-1
     for (int k = 1; k < Nt; ++k) {
       const int uk = u_offset + k * Nu;
       const int ukm1 = u_offset + (k - 1) * Nu;
 
-      // u_k - u_{k-1} <= du_max  and >= -du_max
-      // We implement as:
-      //   A * z in [l,u] with A = [I on uk, -I on ukm1]
-      // so l=-du_max, u=du_max
+      // u_k - u_{k-1} <= du_max 且 >= -du_max
+      // 通过 A * z ∈ [l,u] 实现，A = [uk 的 I, ukm1 的 -I]
+      // l = -du_max, u = du_max
       for (int i = 0; i < Nu; ++i) {
         At.emplace_back(row + i, uk + i, 1.0);
         At.emplace_back(row + i, ukm1 + i, -1.0);
@@ -678,7 +675,7 @@ private:
     }
 
     if (row != ncon) {
-      // Safety check
+      // 安全检查
       throw std::runtime_error("Primary QP constraint count mismatch: row != ncon");
     }
 
@@ -688,26 +685,26 @@ private:
     return qp;
   }
 
-  // ---------------- Secondary QP build ----------------
+  // ---------------- 构建副层 QP ----------------
   SecondaryQP buildSecondaryQP(const FeasibleSet& fs,
                                const Eigen::Matrix<double, 7, 7>& Nproj) {
     const int Nu = GMPCParams::Nu;
     const int Nt = params_.Nt;
 
-    // Variables: U_seq (Nu*Nt)
+    // 变量：U_seq (Nu*Nt)
     const int nvar = Nu * Nt;
 
-    // Constraints:
-    // (1) deviation box around primary u_seq: 2*Nu*Nt
-    // (2) control bounds: 2*Nu*Nt
+    // 约束：
+    // (1) 主层 u_seq 周围的偏差盒：2*Nu*Nt
+    // (2) 控制边界：2*Nu*Nt
     const int ncon = 4 * Nu * Nt;
 
     SecondaryQP qp;
     qp.nvar = nvar;
     qp.ncon = ncon;
 
-    // Extract primary full u sequence from full solution:
-    // primary solution layout: [X(0..Nt); U(0..Nt-1)]
+    // 从完整解中提取主层的 u 序列：
+    // 主层解排布为 [X(0..Nt); U(0..Nt-1)]
     const int state_vars = (params_.Nt + 1) * GMPCParams::Nx;
     const int control_vars = GMPCParams::Nu * params_.Nt;
     if (fs.full_solution.size() < state_vars + control_vars) {
@@ -715,39 +712,38 @@ private:
     }
     Eigen::VectorXd u_primary_full = fs.full_solution.segment(state_vars, control_vars);
 
-    // Reshape u_primary_full into Nu x Nt
-    // MATLAB used reshape to (Nt x Nu)
+    // 将 u_primary_full 重塑为 Nu x Nt（MATLAB 里 reshape 为 Nt x Nu）
     std::vector<Eigen::Matrix<double, 7, 1>> uref_seq(params_.Nt);
     for (int k = 0; k < params_.Nt; ++k) {
       uref_seq[k] = u_primary_full.segment(k * Nu, Nu);
     }
 
-    // --------- Secondary cost: smoothness + nullspace preference ---------
-    // M2 = sparse(total_vars,total_vars); q2 = zeros
+    // --------- 副层代价：平滑 + 零空间偏好 ---------
+    // 与 MATLAB 一致：M2 = sparse(total_vars,total_vars); q2 = zeros
     std::vector<Eigen::Triplet<double>> Ht;
     Ht.reserve(static_cast<size_t>(nvar * 8));
     qp.g = Eigen::VectorXd::Zero(nvar);
 
-    // Smoothness:
-    // k=0: (u0 - u_prev)^2 if available, else just u0^2
-    // k>0: (uk - u_{k-1})^2
+    // 平滑性：
+    // k=0：若有上一周期则 (u0 - u_prev)^2，否则仅 u0^2
+    // k>0： (uk - u_{k-1})^2
     const double ws = params_.w_smooth;
     if (ws > 0.0) {
       for (int k = 0; k < Nt; ++k) {
         const int uk = k * Nu;
         if (k == 0) {
-          // Add ws * I on u0
+          // 在 u0 上加入 ws * I
           for (int i = 0; i < Nu; ++i) Ht.emplace_back(uk + i, uk + i, ws);
           if (last_u_prev_valid_) {
             qp.g.segment(uk, Nu) += -(ws * last_u_cmd_);
           }
         } else {
           const int ukm1 = (k - 1) * Nu;
-          // uk^2
+          // uk^2 项
           for (int i = 0; i < Nu; ++i) Ht.emplace_back(uk + i, uk + i, ws);
-          // ukm1^2
+          // ukm1^2 项
           for (int i = 0; i < Nu; ++i) Ht.emplace_back(ukm1 + i, ukm1 + i, ws);
-          // cross -ws
+          // 交叉项 -ws
           for (int i = 0; i < Nu; ++i) {
             Ht.emplace_back(uk + i, ukm1 + i, -ws);
             Ht.emplace_back(ukm1 + i, uk + i, -ws);
@@ -756,7 +752,7 @@ private:
       }
     }
 
-    // Nullspace preference: sum_k u_k^T (N^T R_null N) u_k
+    // 零空间偏好：sum_k u_k^T (N^T R_null N) u_k
     const double wn = params_.w_null;
     Eigen::Matrix<double, 7, 7> Nw = Nproj.transpose() * params_.R_null * Nproj;
     if (wn > 0.0) {
@@ -771,13 +767,13 @@ private:
       }
     }
 
-    // Regularize
+    // 正则化
     for (int i = 0; i < nvar; ++i) Ht.emplace_back(i, i, 1e-9);
 
     qp.H.resize(nvar, nvar);
     qp.H.setFromTriplets(Ht.begin(), Ht.end());
 
-    // --------- Secondary constraints: deviation box + bounds ---------
+    // --------- 副层约束：偏差盒 + 边界 ---------
     std::vector<Eigen::Triplet<double>> At;
     At.reserve(static_cast<size_t>(ncon * 2));
     qp.l = Eigen::VectorXd::Constant(ncon, -std::numeric_limits<double>::infinity());
@@ -786,36 +782,36 @@ private:
     int row = 0;
     const double delta = fs.deviation_bound;
 
-    // (1) deviation: u <= uref + delta  and u >= uref - delta
-    // We express as two sets:
-    //   +I*u in [-inf, uref+delta]
-    //   -I*u in [-inf, -(uref-delta)]  <=> u >= uref-delta
+    // (1) 偏差约束：u <= uref + delta 且 u >= uref - delta
+    // 拆成两组：
+    //   +I*u ∈ [-inf, uref+delta]
+    //   -I*u ∈ [-inf, -(uref-delta)]  <=> u >= uref-delta
     for (int k = 0; k < Nt; ++k) {
       const int uk = k * Nu;
       const Eigen::Matrix<double, 7, 1> uref = uref_seq[k];
 
-      // u <= uref + delta
+      // 上界：u <= uref + delta
       for (int i = 0; i < Nu; ++i) At.emplace_back(row + i, uk + i, 1.0);
       qp.u.segment(row, Nu) = uref.array() + delta;
       row += Nu;
 
-      // -u <= -(uref - delta)
+      // 下界：-u <= -(uref - delta)
       for (int i = 0; i < Nu; ++i) At.emplace_back(row + i, uk + i, -1.0);
       qp.u.segment(row, Nu) = -(uref.array() - delta);
       row += Nu;
     }
 
-    // (2) bounds: umin <= u <= umax (two-sided)
+    // (2) 边界：umin <= u <= umax（双边）
     for (int k = 0; k < Nt; ++k) {
       const int uk = k * Nu;
 
-      // +I*u in [umin, umax]
+      // 正向约束：+I*u ∈ [umin, umax]
       for (int i = 0; i < Nu; ++i) At.emplace_back(row + i, uk + i, 1.0);
       qp.l.segment(row, Nu) = params_.umin;
       qp.u.segment(row, Nu) = params_.umax;
       row += Nu;
 
-      // -I*u in [-umax, -umin]  (redundant but matches MATLAB structure)
+      // 反向约束：-I*u ∈ [-umax, -umin]（冗余，但与 MATLAB 结构一致）
       for (int i = 0; i < Nu; ++i) At.emplace_back(row + i, uk + i, -1.0);
       qp.l.segment(row, Nu) = -params_.umax;
       qp.u.segment(row, Nu) = -params_.umin;
@@ -829,7 +825,7 @@ private:
     qp.A.resize(ncon, nvar);
     qp.A.setFromTriplets(At.begin(), At.end());
 
-    // Fix infeasible rows (if any): l>u
+    // 修正不可行行（若存在 l>u）
     for (int i = 0; i < qp.l.size(); ++i) {
       if (qp.l(i) > qp.u(i)) {
         qp.l(i) = qp.u(i) - 1e-9;
@@ -839,7 +835,7 @@ private:
     return qp;
   }
 
-  // ---------------- Performance degradation (MATLAB style) ----------------
+  // ---------------- 性能下降评估（MATLAB 风格） ----------------
   double evaluatePerformanceDegradation(const Eigen::Matrix<double, 7, 1>& u_final,
                                         const Eigen::Matrix<double, 7, 1>& u_primary) const {
     const double change = (u_final - u_primary).norm();
@@ -850,7 +846,7 @@ private:
     return degr;
   }
 
-  // ---------------- OSQP Solve wrappers ----------------
+  // ---------------- OSQP 求解封装 ----------------
   int solveOSQPPrimary(const PrimaryQP& qp, Eigen::VectorXd* sol_x) {
     if (!sol_x) return -1;
 
@@ -876,30 +872,30 @@ private:
       primary_primal_ = Eigen::VectorXd::Zero(qp.nvar);
       primary_dual_   = Eigen::VectorXd::Zero(qp.ncon);
     } else {
-      // update QP
+      // 更新 QP
       primary_solver_.updateHessianMatrix(qp.H);
       primary_solver_.updateGradient(qp.g);
       primary_solver_.updateLinearConstraintsMatrix(qp.A);
       primary_solver_.updateBounds(qp.l, qp.u);
     }
 
-    // warm start
+    // 热启动
     if (primary_primal_.size() == qp.nvar) primary_solver_.setWarmStart(primary_primal_);
     if (primary_dual_.size()   == qp.ncon) primary_solver_.setWarmStartDual(primary_dual_);
 
     const auto ret = primary_solver_.solveProblem();
     const int status = static_cast<int>(ret);
 
-    // OsqpEigen returns enum; we map:
-    // 0 = NoError (solved), others are errors.
-    // We'll treat 0 as success (status_val == 1 in MATLAB)
+    // OsqpEigen 返回枚举：
+    // 0 = NoError（已求解），其他为错误。
+    // 这里把 0 视为成功（类似 MATLAB 的 status=1）
     if (status == 0) {
       *sol_x = primary_solver_.getSolution();
       primary_primal_ = *sol_x;
       primary_dual_ = primary_solver_.getDualSolution();
       return 1;
     } else {
-      // still try to fetch best-effort solution
+      // 仍尝试获取当前最优解
       *sol_x = primary_solver_.getSolution();
       primary_primal_ = *sol_x;
       primary_dual_ = primary_solver_.getDualSolution();
@@ -961,7 +957,7 @@ private:
   mutable std::mutex mutex_;
   GMPCParams params_;
 
-  // OSQP solvers and warm-start caches
+  // OSQP 求解器与热启动缓存
   OsqpEigen::Solver primary_solver_;
   OsqpEigen::Solver secondary_solver_;
   bool primary_initialized_ = false;
@@ -971,26 +967,26 @@ private:
   Eigen::VectorXd secondary_primal_;
   Eigen::VectorXd secondary_dual_;
 
-  // Jdot estimation
+  // Jdot 估计缓存
   bool J_prev_valid_ = false;
   Eigen::Matrix<double, 6, 7> J_prev_;
 
-  // last command for cross-cycle constraint
+  // 上一周期控制量（用于跨周期约束）
   Eigen::Matrix<double, 7, 1> last_u_cmd_ = Eigen::Matrix<double, 7, 1>::Zero();
   bool last_u_prev_valid_ = false;
 };
 
-// ------------------------------ End of file ------------------------------
+// ------------------------------ 文件结尾提示 ------------------------------
 //
-// Usage in controller (sketch):
+// 控制器使用示例：
 //   DualLayerGMPC gmpc;
-//   GMPCParams p; ... fill ...
+//   GMPCParams p; ... 填写 ...
 //   gmpc.setParams(p);
 //
-// In update():
-//   GMPCInput in; fill q,dq, pose, pose_d, Vd, M,coriolis,gravity,J
+// 在 update() 中：
+//   GMPCInput in; 填写 q、dq、位姿、目标位姿、Vd、M、coriolis、gravity、J
 //   Eigen::Matrix<double,7,1> u = gmpc.computeTau(in);
-//   Eigen::Matrix<double,7,1> tau_cmd = u + coriolis;  // recommended
+//   Eigen::Matrix<double,7,1> tau_cmd = u + coriolis;  // 推荐做法
 //   tau_cmd = saturateTorqueRate(tau_cmd, tau_J_d);
 //   setCommand(tau_cmd)
 //
