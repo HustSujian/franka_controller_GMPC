@@ -73,8 +73,22 @@ namespace serl_franka_controllers
   static inline Eigen::Matrix<double, 7, 6> pseudoInvJ(
       const Eigen::Matrix<double, 6, 7> &J)
   {
-    // 使用完全正交分解的伪逆（数值稳定）
-    return J.completeOrthogonalDecomposition().pseudoInverse();
+    // 通过 SVD 显式构造伪逆：J^+ = V * S^+ * U'
+    Eigen::JacobiSVD<Eigen::Matrix<double, 6, 7>> svd(
+        J, Eigen::ComputeThinU | Eigen::ComputeThinV);
+    const auto &singular = svd.singularValues();
+
+    Eigen::Matrix<double, 7, 6> S_pinv = Eigen::Matrix<double, 7, 6>::Zero();
+    const double tol = 1e-9;
+    for (int i = 0; i < singular.size(); ++i)
+    {
+      if (std::abs(singular(i)) > tol)
+      {
+        S_pinv(i, i) = 1.0 / singular(i);
+      }
+    }
+
+    return svd.matrixV() * S_pinv * svd.matrixU().transpose();
   }
 
   // 雅可比矩阵条件数计算：通过SVD求最大最小奇异值之比
@@ -1056,7 +1070,7 @@ namespace serl_franka_controllers
     // 功能：初始化/更新求解器，应用热启动，求解并保存解用于下次热启动
     // 调用位置：computeTau()中求解主层MPC
     // 参考：Jacobian.cpp中验证的求解器设置（5000迭代，1e-6容差，自适应rho）
-    int solveOSQPPrimary(const PrimaryQP &qp, Eigen::VectorXd *sol_x)
+    int solveOSQPPrimary(PrimaryQP &qp, Eigen::VectorXd *sol_x)
     {
       if (!sol_x)
         return -1;
@@ -1102,10 +1116,10 @@ namespace serl_franka_controllers
       }
 
       // 热启动
-      if (primary_primal_.size() == qp.nvar)
-        primary_solver_.setWarmStart(primary_primal_);
-      if (primary_dual_.size() == qp.ncon)
-        primary_solver_.setWarmStartDual(primary_dual_);
+      if (primary_primal_.size() == qp.nvar && primary_dual_.size() == qp.ncon)
+      {
+        primary_solver_.setWarmStart(primary_primal_, primary_dual_);
+      }
 
       const auto ret = primary_solver_.solveProblem();
       const int status = static_cast<int>(ret);
@@ -1157,110 +1171,113 @@ namespace serl_franka_controllers
     // 输出：求解状态码，1=成功，其他=失败
     // 功能：与主层类似，但优化目标不同（平滑度+零空间）
     // 调用位置：computeTau()中在主层解基础上进一步优化
-    int solveOSQPSecondary(const SecondaryQP &qp, Eigen::VectorXd *sol_x)
+    int solveOSQPSecondary(SecondaryQP &qp, Eigen::VectorXd *sol_x)
     {
       if (!sol_x)
         return -1;
       // 下层QP使用更严格的设置以确保精确优化
-      secondary_solver_.settings()->setVerbosity(false);
-      secondary_solver_.settings()->setWarmStart(true);
-      secondary_solver_.settings()->setMaxIteration(3000);
-      primary_solver_.settings()->setAbsoluteTolerance(1e-6);
-      secondary_solver_.settings()->setRelativeTolerance(1e-5);
-      secondary_solver_.settings()->setAdaptiveRho(true
-      secondary_solver_.settings()->setAbsoluteTolerance(1e-5);
-      secondary_solver_.settings()->setRelativeTolerance(1e-5);
-      secondary_solver_.settings()->setPolish(true);
-
-      secondary_solver_.data()->setNumberOfVariables(qp.nvar);
-      secondary_solver_.data()->setNumberOfConstraints(qp.ncon);
-      if (!secondary_solver_.data()->setHessianMatrix(qp.H)) return -1;
-      if (!secondary_solver_.data()->setGradient(qp.g)) return -1;
-      if (!secondary_solver_.data()->setLinearConstraintsMatrix(qp.A)) return -1;
-      if (!secondary_solver_.data()->setLowerBound(qp.l)) return -1;
-      if (!secondary_solver_.data()->setUpperBound(qp.u)) return -1;
-
-      if (!secondary_solver_.initSolver()) return -1;
-      secondary_initialized_ = true;
-
-      secondary_primal_ = Eigen::VectorXd::Zero(qp.nvar);
-      secondary_dual_   = Eigen::VectorXd::Zero(qp.ncon);
-    }
-    else
-    {
-      secondary_solver_.updateHessianMatrix(qp.H);
-      secondary_solver_.updateGradient(qp.g);
-      secondary_solver_.updateLinearConstraintsMatrix(qp.A);
-      secondary_solver_.updateBounds(qp.l, qp.u);
-    }
-
-    if (secondary_primal_.size() == qp.nvar)
-      secondary_solver_.setWarmStart(secondary_primal_);
-    if (secondary_dual_.size() == qp.ncon)
-      secondary_solver_.setWarmStartDual(secondary_dual_);
-
-    const auto ret = secondary_solver_.solveProblem();
-    const int status = static_cast<int>(ret);
-
-    if (status == 0)
-    {
-      *sol_x = secondary_solver_.getSolution();
-
-      // 安全检查：检查解是否有效（参考Jacobian.cpp）
-      bool has_invalid_value = false;
-      for (int i = 0; i < sol_x->size(); ++i)
+      if (!secondary_initialized_)
       {
-        if (std::isnan((*sol_x)(i)) || std::isinf((*sol_x)(i)))
-        {
-          has_invalid_value = true;
-          std::cerr << "Secondary QP solution contains NaN or Inf at index " << i << std::endl;
-          break;
-        }
-      }
+        secondary_solver_.settings()->setVerbosity(false);
+        secondary_solver_.settings()->setWarmStart(true);
+        secondary_solver_.settings()->setMaxIteration(3000);
+        primary_solver_.settings()->setAbsoluteTolerance(1e-6);
+        secondary_solver_.settings()->setRelativeTolerance(1e-5);
+        secondary_solver_.settings()->setAdaptiveRho(true);
+        secondary_solver_.settings()->setAbsoluteTolerance(1e-5);
+        secondary_solver_.settings()->setRelativeTolerance(1e-5);
+        secondary_solver_.settings()->setPolish(true);
 
-      if (!has_invalid_value)
-      {
-        secondary_primal_ = *sol_x;
-        secondary_dual_ = secondary_solver_.getDualSolution();
-        return 1;
+        secondary_solver_.data()->setNumberOfVariables(qp.nvar);
+        secondary_solver_.data()->setNumberOfConstraints(qp.ncon);
+        if (!secondary_solver_.data()->setHessianMatrix(qp.H)) return -1;
+        if (!secondary_solver_.data()->setGradient(qp.g)) return -1;
+        if (!secondary_solver_.data()->setLinearConstraintsMatrix(qp.A)) return -1;
+        if (!secondary_solver_.data()->setLowerBound(qp.l)) return -1;
+        if (!secondary_solver_.data()->setUpperBound(qp.u)) return -1;
+
+        if (!secondary_solver_.initSolver()) return -1;
+        secondary_initialized_ = true;
+
+        secondary_primal_ = Eigen::VectorXd::Zero(qp.nvar);
+        secondary_dual_   = Eigen::VectorXd::Zero(qp.ncon);
       }
       else
       {
-        sol_x->setZero();
-        std::cerr << "Secondary QP: Invalid solution detected, returning zero" << std::endl;
+        secondary_solver_.updateHessianMatrix(qp.H);
+        secondary_solver_.updateGradient(qp.g);
+        secondary_solver_.updateLinearConstraintsMatrix(qp.A);
+        secondary_solver_.updateBounds(qp.l, qp.u);
+      }
+
+      if (secondary_primal_.size() == qp.nvar && secondary_dual_.size() == qp.ncon)
+      {
+        secondary_solver_.setWarmStart(secondary_primal_, secondary_dual_);
+      }
+
+      const auto ret = secondary_solver_.solveProblem();
+      const int status = static_cast<int>(ret);
+
+      if (status == 0)
+      {
+        *sol_x = secondary_solver_.getSolution();
+
+        // 安全检查：检查解是否有效（参考Jacobian.cpp）
+        bool has_invalid_value = false;
+        for (int i = 0; i < sol_x->size(); ++i)
+        {
+          if (std::isnan((*sol_x)(i)) || std::isinf((*sol_x)(i)))
+          {
+            has_invalid_value = true;
+            std::cerr << "Secondary QP solution contains NaN or Inf at index " << i << std::endl;
+            break;
+          }
+        }
+
+        if (!has_invalid_value)
+        {
+          secondary_primal_ = *sol_x;
+          secondary_dual_ = secondary_solver_.getDualSolution();
+          return 1;
+        }
+        else
+        {
+          sol_x->setZero();
+          std::cerr << "Secondary QP: Invalid solution detected, returning zero" << std::endl;
+          return -1;
+        }
+      }
+      else
+      {
+        *sol_x = secondary_solver_.getSolution();
+        secondary_primal_ = *sol_x;
+        secondary_dual_ = secondary_solver_.getDualSolution();
         return -1;
       }
     }
-    else
-    {
-      *sol_x = secondary_solver_.getSolution();
-      secondary_primal_ = *sol_x;
-      secondary_dual_ = secondary_solver_.getDualSolution();
-      return -1;
-    }
-}
 
-private : mutable std::mutex mutex_;
-  GMPCParams params_;
+  private:
+    mutable std::mutex mutex_;
+    GMPCParams params_;
 
-  // OSQP 求解器与热启动缓存
-  OsqpEigen::Solver primary_solver_;
-  OsqpEigen::Solver secondary_solver_;
-  bool primary_initialized_ = false;
-  bool secondary_initialized_ = false;
-  Eigen::VectorXd primary_primal_;
-  Eigen::VectorXd primary_dual_;
-  Eigen::VectorXd secondary_primal_;
-  Eigen::VectorXd secondary_dual_;
+    // OSQP 求解器与热启动缓存
+    OsqpEigen::Solver primary_solver_;
+    OsqpEigen::Solver secondary_solver_;
+    bool primary_initialized_ = false;
+    bool secondary_initialized_ = false;
+    Eigen::VectorXd primary_primal_;
+    Eigen::VectorXd primary_dual_;
+    Eigen::VectorXd secondary_primal_;
+    Eigen::VectorXd secondary_dual_;
 
-  // Jdot 估计缓存
-  bool J_prev_valid_ = false;
-  Eigen::Matrix<double, 6, 7> J_prev_;
+    // Jdot 估计缓存
+    bool J_prev_valid_ = false;
+    Eigen::Matrix<double, 6, 7> J_prev_;
 
-  // 上一周期控制量（用于跨周期约束）
-  Eigen::Matrix<double, 7, 1> last_u_cmd_ = Eigen::Matrix<double, 7, 1>::Zero();
-  bool last_u_prev_valid_ = false;
-};
+    // 上一周期控制量（用于跨周期约束）
+    Eigen::Matrix<double, 7, 1> last_u_cmd_ = Eigen::Matrix<double, 7, 1>::Zero();
+    bool last_u_prev_valid_ = false;
+  };
 
 // ------------------------------ 文件结尾提示 ------------------------------
 //

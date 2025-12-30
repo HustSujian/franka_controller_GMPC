@@ -137,8 +137,8 @@ struct DesiredState13 {
 // 完整定义在 gmpc_dual_layer.cpp 中，包含所有内部函数：
 //   - buildPrimaryQP()      构建主层QP问题
 //   - buildSecondaryQP()    构建副层QP问题
-//// 构造函数：创建GMPC求解器实例
-  // 内部会创建 DualLayerGMPC 对象并初始化OSQP求解器
+// 构造函数：创建GMPC求解器实例
+// 内部会创建 DualLayerGMPC 对象并初始化OSQP求解器
   GMPCDualLayer();
   
   // 析构函数：自动清理内部资源
@@ -213,6 +213,8 @@ private:
 // 
 // 这些内部函数通过 impl_ 指针间接调用，外部无需知道它们
 // 
+class DualLayerGMPC;
+
 class GMPCDualLayer {
 public:
   GMPCDualLayer();
