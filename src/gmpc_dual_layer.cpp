@@ -73,8 +73,22 @@ namespace serl_franka_controllers
   static inline Eigen::Matrix<double, 7, 6> pseudoInvJ(
       const Eigen::Matrix<double, 6, 7> &J)
   {
-    // 使用完全正交分解的伪逆（数值稳定）
-    return J.completeOrthogonalDecomposition().pseudoInverse();
+    // 通过 SVD 显式构造伪逆：J^+ = V * S^+ * U'
+    Eigen::JacobiSVD<Eigen::Matrix<double, 6, 7>> svd(
+        J, Eigen::ComputeThinU | Eigen::ComputeThinV);
+    const auto &singular = svd.singularValues();
+
+    Eigen::Matrix<double, 7, 6> S_pinv = Eigen::Matrix<double, 7, 6>::Zero();
+    const double tol = 1e-9;
+    for (int i = 0; i < singular.size(); ++i)
+    {
+      if (std::abs(singular(i)) > tol)
+      {
+        S_pinv(i, i) = 1.0 / singular(i);
+      }
+    }
+
+    return svd.matrixV() * S_pinv * svd.matrixU().transpose();
   }
 
   // 雅可比矩阵条件数计算：通过SVD求最大最小奇异值之比
@@ -1056,7 +1070,7 @@ namespace serl_franka_controllers
     // 功能：初始化/更新求解器，应用热启动，求解并保存解用于下次热启动
     // 调用位置：computeTau()中求解主层MPC
     // 参考：Jacobian.cpp中验证的求解器设置（5000迭代，1e-6容差，自适应rho）
-    int solveOSQPPrimary(const PrimaryQP &qp, Eigen::VectorXd *sol_x)
+    int solveOSQPPrimary(PrimaryQP &qp, Eigen::VectorXd *sol_x)
     {
       if (!sol_x)
         return -1;
@@ -1102,10 +1116,10 @@ namespace serl_franka_controllers
       }
 
       // 热启动
-      if (primary_primal_.size() == qp.nvar)
-        primary_solver_.setWarmStart(primary_primal_);
-      if (primary_dual_.size() == qp.ncon)
-        primary_solver_.setWarmStartDual(primary_dual_);
+      if (primary_primal_.size() == qp.nvar && primary_dual_.size() == qp.ncon)
+      {
+        primary_solver_.setWarmStart(primary_primal_, primary_dual_);
+      }
 
       const auto ret = primary_solver_.solveProblem();
       const int status = static_cast<int>(ret);
@@ -1157,7 +1171,7 @@ namespace serl_franka_controllers
     // 输出：求解状态码，1=成功，其他=失败
     // 功能：与主层类似，但优化目标不同（平滑度+零空间）
     // 调用位置：computeTau()中在主层解基础上进一步优化
-    int solveOSQPSecondary(const SecondaryQP &qp, Eigen::VectorXd *sol_x)
+    int solveOSQPSecondary(SecondaryQP &qp, Eigen::VectorXd *sol_x)
     {
       if (!sol_x)
         return -1;
@@ -1196,10 +1210,10 @@ namespace serl_franka_controllers
         secondary_solver_.updateBounds(qp.l, qp.u);
       }
 
-      if (secondary_primal_.size() == qp.nvar)
-        secondary_solver_.setWarmStart(secondary_primal_);
-      if (secondary_dual_.size() == qp.ncon)
-        secondary_solver_.setWarmStartDual(secondary_dual_);
+      if (secondary_primal_.size() == qp.nvar && secondary_dual_.size() == qp.ncon)
+      {
+        secondary_solver_.setWarmStart(secondary_primal_, secondary_dual_);
+      }
 
       const auto ret = secondary_solver_.solveProblem();
       const int status = static_cast<int>(ret);
