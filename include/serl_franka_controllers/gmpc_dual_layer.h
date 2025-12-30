@@ -1,153 +1,147 @@
 // ====================================================================================
-// gmpc_dual_layer.h - 双层GMPC控制器公共接口头文件
-// ====================================================================================
-// 
-// 【头文件作用】
-// 1. 定义公共数据结构（参数、输入、期望轨迹）
-// 2. 声明控制器接口类 GMPCDualLayer（供外部调用）
-// 3. 前向声明内部实现类 DualLayerGMPC（隐藏实现细节）
-// 
-// 【为什么没有声明内部函数】
-// 本头文件采用 Pimpl（指针实现）设计模式：
-//   - GMPCDualLayer：公共接口类，只声明外部需要的接口函数
-//   - DualLayerGMPC：内部实现类，在.cpp中完整定义，包含所有内部函数
-// 
-// 优点：
-//   1. 编译隔离：修改内部实现不需要重新编译所有依赖此头文件的代码
-//   2. 接口简洁：外部只看到必要的接口，不暴露复杂的内部算法细节
-//   3. 依赖隔离：OSQP等内部求解器细节不泄露到头文件
-//   4. 二进制兼容：内部实现改变不影响ABI（应用程序二进制接口）
-// 
-// 【使用方式】
-// 在控制器中：
-//   #include <serl_franka_controllers/gmpc_dual_layer.h>
-//   
-//   GMPCDualLayer gmpc_;           // 创建GMPC对象
-//   GMPCParams params;             // 设置参数
-//   params.Nt = 10;
-//   gmpc_.setParams(params);
-//   
-//   DesiredState13 xd0;            // 期望状态
-//   Eigen::Matrix<double,7,1> tau; // 输出力矩
-//   gmpc_.computeTauMPC(..., &tau);
-// 
-// 【内部函数在哪里】
-// 所有内部函数（buildPrimaryQP, solveOSQP等）在 gmpc_dual_layer.cpp 的 DualLayerGMPC 类中实现
-// 不需要在此头文件声明，因为外部不直接调用它们
+// gmpc_dual_layer.h  (CPP兼容版)
+// 双层 GMPC 控制器 —— 公共接口头文件（Pimpl）
+//
+// 关键：GMPCParams 保持与 gmpc_dual_layer.cpp 内部实现一致：
+// - static constexpr Nx/Nu
+// - 含 use_R_delta / R_delta / R_cross
+// - 含 xmin_rot/xmax_rot/xmin_pos/xmax_pos/xmin_vel/xmax_vel
+// - 含 du_max / du_cross_max
+//
+// 注意：不要在 .cpp 里再次定义 GMPCParams（会重复定义）
 // ====================================================================================
 
 #pragma once
 
 #include <Eigen/Dense>
-#include <Eigen/Sparse>
-#include <OsqpEigen/OsqpEigen.h>
-#include <array>
-#include <vector>
-#include <cstdint>
 #include <memory>
 
 namespace serl_franka_controllers {
 
+
+
 // ===============================
-// GMPC参数结构体 - 存储所有可调参数
-// 用途：控制器调用 setParams() 传入此结构配置GMPC行为
-// 参考：7dof-双层.txt MATLAB实现 + Jacobian.cpp验证的参数
+// GMPCParams：可调参数（与 .cpp 兼容）
 // ===============================
-struct GMPCParams {
-  // dimensions
-  int Nx = 12;
-  int Nu = 7;
-  int Nt = 10;
+struct GMPCParams
+{
+  // 维度（固定）
+  static constexpr int Nx = 12; // state: [phi(6); V(6)]
+  static constexpr int Nu = 7;  // input: joint torque
+  int Nt = 10;                  // horizon
+  double dt = 0.001;            // sampling time
 
-  // discretization
-  double dt = 0.001;
+  // ------------------------------
+  // 主层代价权重
+  // ------------------------------
+  Eigen::Matrix<double, Nx, Nx> Q = Eigen::Matrix<double, Nx, Nx>::Identity();
+  Eigen::Matrix<double, Nx, Nx> P = Eigen::Matrix<double, Nx, Nx>::Identity();
+  Eigen::Matrix<double, Nu, Nu> R = 1e-8 * Eigen::Matrix<double, Nu, Nu>::Identity();
 
-  // bounds
-  Eigen::Matrix<double, 12, 1> xmin = Eigen::Matrix<double, 12, 1>::Constant(-10.0);
-  Eigen::Matrix<double, 12, 1> xmax = Eigen::Matrix<double, 12, 1>::Constant( 10.0);
+  // 可选：Δu 权重（cpp 用到了）
+  bool use_R_delta = false;
+  Eigen::Matrix<double, Nu, Nu> R_delta = Eigen::Matrix<double, Nu, Nu>::Zero();
+  Eigen::Matrix<double, Nu, Nu> R_cross = Eigen::Matrix<double, Nu, Nu>::Zero();
 
-  Eigen::Matrix<double, 7, 1> umin;
-  Eigen::Matrix<double, 7, 1> umax;
+  // ------------------------------
+  // 控制输入约束
+  // ------------------------------
+  Eigen::Matrix<double, Nu, 1> umin = (-50.0) * Eigen::Matrix<double, Nu, 1>::Ones();
+  Eigen::Matrix<double, Nu, 1> umax = ( 50.0) * Eigen::Matrix<double, Nu, 1>::Ones();
 
-  // costs
-  Eigen::Matrix<double, 12, 12> Q;
-  Eigen::Matrix<double, 7, 7>   R;
-  Eigen::Matrix<double, 12, 12> P;
+  // 时域内力矩变化约束 |u_k - u_{k-1}| <= du_max
+  Eigen::Matrix<double, Nu, 1> du_max = (20.0) * Eigen::Matrix<double, Nu, 1>::Ones();
 
-  // second layer weights (from your MATLAB)
+  // 跨周期首步变化约束 |u_0 - u_prev| <= du_cross_max
+  Eigen::Matrix<double, Nu, 1> du_cross_max = (10.0) * Eigen::Matrix<double, Nu, 1>::Ones();
+
+  // ------------------------------
+  // 状态（误差）约束（总约束）
+  // ------------------------------
+  Eigen::Matrix<double, Nx, 1> xmin = (-10.0) * Eigen::Matrix<double, Nx, 1>::Ones();
+  Eigen::Matrix<double, Nx, 1> xmax = ( 10.0) * Eigen::Matrix<double, Nx, 1>::Ones();
+
+  // 可选：分块约束（cpp 用到了）
+  Eigen::Matrix<double, 3, 1> xmin_rot = (-10.0) * Eigen::Matrix<double, 3, 1>::Ones();
+  Eigen::Matrix<double, 3, 1> xmax_rot = ( 10.0) * Eigen::Matrix<double, 3, 1>::Ones();
+
+  Eigen::Matrix<double, 3, 1> xmin_pos = (-0.2) * Eigen::Matrix<double, 3, 1>::Ones();
+  Eigen::Matrix<double, 3, 1> xmax_pos = ( 0.2) * Eigen::Matrix<double, 3, 1>::Ones();
+
+  Eigen::Matrix<double, 6, 1> xmin_vel = (-2.0) * Eigen::Matrix<double, 6, 1>::Ones();
+  Eigen::Matrix<double, 6, 1> xmax_vel = ( 2.0) * Eigen::Matrix<double, 6, 1>::Ones();
+
+  // ------------------------------
+  // 副层参数
+  // ------------------------------
+  double alpha_tolerance  = 0.95;
+  double delta_deviation  = 0.001; // feasible box around primary solution
+  Eigen::Matrix<double, Nu, Nu> R_null = Eigen::Matrix<double, Nu, Nu>::Identity();
   double w_smooth = 1e-8;
   double w_null   = 1e-6;
-  Eigen::Matrix<double,7,7> R_smooth = Eigen::Matrix<double,7,7>::Identity();
-  Eigen::Matrix<double,7,7> R_null   = (Eigen::Matrix<double,7,7>() <<
+
+  GMPCParams()
+  {
+    // 这里给一个“与你之前 .h 版本一致”的默认权重（可按需删/改）
+    Q.setZero();
+    Q.block<3,3>(0,0) = 20.0 * Eigen::Matrix3d::Identity();
+    Q.block<3,3>(3,3) = 20.0 * Eigen::Matrix3d::Identity();
+    Q.block<6,6>(6,6) = 800.0 * Eigen::Matrix<double,6,6>::Identity();
+
+    R.setZero();
+    R.diagonal().setConstant(1e-8);
+
+    P = 10.0 * Q;
+
+    // null 权重（按你之前那组）
+    R_null.setZero();
+    R_null <<
       0.1,0,0,0,0,0,0,
       0,1.0,0,0,0,0,0,
       0,0,1.0,0,0,0,0,
       0,0,0,1.0,0,0,0,
       0,0,0,0,0.1,0,0,
       0,0,0,0,0,0.1,0,
-      0,0,0,0,0,0,0.1).finished();
+      0,0,0,0,0,0,0.1;
 
-  // second layer: deviation bound (delta_deviation)
-  double delta_deviation = 0.001;   // 
-  double lambda_dls      = 0.01;    // DLS base
-
-  // performance tolerance (alpha_tolerance) —  MATLAB 有，但这里先留接口
-  double alpha_tolerance = 0.95;
-
-  GMPCParams() {
+    // Franka 关节力矩安全范围（你原来用的）
     umax << 50, 50, 50, 28, 28, 28, 28;
     umin = -umax;
-
-    // Jacobian.cpp: Q_ / R_ 的量级
-    Q.setZero();
-    Q.block<3,3>(0,0) = 20.0 * Eigen::Matrix3d::Identity();     // rotation err
-    Q.block<3,3>(3,3) = 20.0 * Eigen::Matrix3d::Identity();     // translation err
-    Q.block<6,6>(6,6) = 800.0 * Eigen::Matrix<double,6,6>::Identity(); // twist (or vel) err part
-
-    // Q = (Eigen::VectorXd(12) <<
-    //  20,20,20,
-    //  520,520,525,
-    //  2,2,2,
-    //  5,5,10).finished().asDiagonal();
-
-    R.setZero();
-    R.diagonal() << 1e-8,1e-8,1e-8,1e-8,1e-8,1e-8,1e-8;
-
-    P = 10.0 * Q;
   }
 };
 
 // ===============================
-// 期望轨迹状态容器 - 单个时刻的期望状态
-// 格式遵循 Jacobian.cpp 约定：13维向量
+// DesiredState13：单个时刻的期望状态容器
 // [qw qx qy qz px py pz wx wy wz vx vy vz]
-//  |四元数姿态| |位置| |角速度| |线速度|
-// 用途：从控制器传入当前时刻的期望状态给GMPC
 // ===============================
 struct DesiredState13 {
   Eigen::Matrix<double, 13, 1> v = Eigen::Matrix<double, 13, 1>::Zero();
 };
 
+    // Trajectory helper (used by controllers)
+void buildSpiralDesiredState13(double t, DesiredState13* xd0);
+
+// Pimpl forward decl
+class DualLayerGMPC;
+
 // ===============================
-// Pimpl（指针实现）设计模式说明
+// GMPCDualLayer：公共接口类
 // ===============================
-// 
+class GMPCDualLayer {
 public:
   GMPCDualLayer();
   ~GMPCDualLayer();
 
-  // 重置求解器状态
+  GMPCDualLayer(const GMPCDualLayer&) = delete;
+  GMPCDualLayer& operator=(const GMPCDualLayer&) = delete;
+
+  GMPCDualLayer(GMPCDualLayer&&) noexcept;
+  GMPCDualLayer& operator=(GMPCDualLayer&&) noexcept;
+
   void reset();
-  
-  // 设置参数
   void setParams(const GMPCParams& p);
-  
-  // 设置时间步长（避免每次都setParams）
   void setDt(double dt);
 
-  // 主计算接口：从Franka状态计算控制力矩
-  // 返回值：成功true，失败false
-  // tau_cmd：输出的7维控制力矩（不含重力补偿）
   bool computeTauMPC(
       const Eigen::Affine3d& O_T_EE,
       const Eigen::Matrix<double,7,1>& q,
@@ -161,7 +155,6 @@ public:
       Eigen::Matrix<double,7,1>* tau_cmd);
 
 private:
-  // Pimpl模式：隐藏实现细节
   std::unique_ptr<DualLayerGMPC> impl_;
 };
 

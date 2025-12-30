@@ -15,8 +15,10 @@
 // - 因此采用仿射的 Vdot 模型：
 //     Vdot = J * M^{-1} * u  +  (Jdot*dq - J*M^{-1}(coriolis+gravity))
 //   并用有限差分估计 Jdot。
-
+#include "serl_franka_controllers/gmpc_dual_layer.h"
 #include <OsqpEigen/OsqpEigen.h>
+#include <ros/ros.h>
+#include <chrono>
 
 #include <Eigen/Core>
 #include <Eigen/Dense>
@@ -226,57 +228,34 @@ namespace serl_franka_controllers
     }
   }
 
-  // ------------------------------ 参数定义 ------------------------------
-
-  struct GMPCParams
+  void buildSpiralDesiredState13(double t, DesiredState13* xd0)
   {
-    // 维度（本实现固定）
-    static constexpr int Nx = 12; // 状态: [phi(6); V(6)]
-    static constexpr int Nu = 7;  // 控制: 关节力矩（或力矩控制项）
-    int Nt = 10;                  // 预测时域长度
-    double dt = 0.001;            // 控制周期，应与 Franka 回路一致
+    if (!xd0) return;
+    xd0->v.setZero();
 
-    // 主层代价权重
-    Eigen::Matrix<double, 12, 12> Q = Eigen::Matrix<double, 12, 12>::Identity();
-    Eigen::Matrix<double, 12, 12> P = Eigen::Matrix<double, 12, 12>::Identity();
-    Eigen::Matrix<double, 7, 7> R = 1e-8 * Eigen::Matrix<double, 7, 7>::Identity();
+    const double radius = 0.4;
+    const double height = 0.2;
+    const double turns  = 0.6;
+    const double t_end  = 30.0;
 
-    // 可选的主层 Δu 权重（类似 MATLAB 的 param.R_delta）
-    bool use_R_delta = false;
-    Eigen::Matrix<double, 7, 7> R_delta = Eigen::Matrix<double, 7, 7>::Zero();
-    Eigen::Matrix<double, 7, 7> R_cross = Eigen::Matrix<double, 7, 7>::Zero();
+    const double x = radius * std::cos(2 * M_PI * turns * t / t_end);
+    const double y = radius * std::sin(2 * M_PI * turns * t / t_end);
+    const double z = 0.9 + height * t / t_end;
 
-    // 控制输入约束
-    Eigen::Matrix<double, 7, 1> umin = (-50.0) * Eigen::Matrix<double, 7, 1>::Ones();
-    Eigen::Matrix<double, 7, 1> umax = (50.0) * Eigen::Matrix<double, 7, 1>::Ones();
+    const double x_d = -radius * (2 * M_PI * turns) / t_end * std::sin(2 * M_PI * turns * t / t_end);
+    const double y_d =  radius * (2 * M_PI * turns) / t_end * std::cos(2 * M_PI * turns * t / t_end);
+    const double z_d =  height / t_end;
 
-    // 时域内的力矩变化硬约束 (|u_k - u_{k-1}| <= max)
-    Eigen::Matrix<double, 7, 1> du_max = (20.0) * Eigen::Matrix<double, 7, 1>::Ones();
+    Eigen::Vector4d q0(0.6, 0, 0, 0.8);
+    q0.normalize();
 
-    // 跨周期首步的力矩变化约束（围绕上一周期 u_prev）
-    Eigen::Matrix<double, 7, 1> du_cross_max = (10.0) * Eigen::Matrix<double, 7, 1>::Ones();
+    xd0->v(0)=q0(0); xd0->v(1)=q0(1); xd0->v(2)=q0(2); xd0->v(3)=q0(3);
+    xd0->v(4)=x; xd0->v(5)=y; xd0->v(6)=z;
+    xd0->v(7)=0; xd0->v(8)=0; xd0->v(9)=0;
+    xd0->v(10)=x_d; xd0->v(11)=y_d; xd0->v(12)=z_d;
+  }
 
-    // 状态（误差）约束，风格参考 MATLAB，具体数值可按应用调节
-    Eigen::Matrix<double, 12, 1> xmin = (-10.0) * Eigen::Matrix<double, 12, 1>::Ones();
-    Eigen::Matrix<double, 12, 1> xmax = (10.0) * Eigen::Matrix<double, 12, 1>::Ones();
 
-    // 相对于目标的实际位姿误差约束（位置/姿态/速度）
-    Eigen::Matrix<double, 3, 1> xmin_rot = (-10.0) * Eigen::Matrix<double, 3, 1>::Ones();
-    Eigen::Matrix<double, 3, 1> xmax_rot = (10.0) * Eigen::Matrix<double, 3, 1>::Ones();
-
-    Eigen::Matrix<double, 3, 1> xmin_pos = (-0.2) * Eigen::Matrix<double, 3, 1>::Ones();
-    Eigen::Matrix<double, 3, 1> xmax_pos = (0.2) * Eigen::Matrix<double, 3, 1>::Ones();
-
-    Eigen::Matrix<double, 6, 1> xmin_vel = (-2.0) * Eigen::Matrix<double, 6, 1>::Ones();
-    Eigen::Matrix<double, 6, 1> xmax_vel = (2.0) * Eigen::Matrix<double, 6, 1>::Ones();
-
-    // 副层参数
-    double alpha_tolerance = 0.95;
-    double delta_deviation = 0.001; // 主层解周围的偏差盒大小
-    Eigen::Matrix<double, 7, 7> R_null = Eigen::Matrix<double, 7, 7>::Identity();
-    double w_smooth = 1e-8;
-    double w_null = 1e-6;
-  };
 
   // ------------------------------ 输入结构体 ------------------------------
 
@@ -324,17 +303,35 @@ namespace serl_franka_controllers
     void resetWarmStart()
     {
       std::lock_guard<std::mutex> lock(mutex_);
+
+      // 1) 清 warm-start 状态
       primary_initialized_ = false;
       secondary_initialized_ = false;
+
       primary_primal_.resize(0);
       primary_dual_.resize(0);
       secondary_primal_.resize(0);
       secondary_dual_.resize(0);
+
       J_prev_valid_ = false;
       J_prev_.setZero();
       last_u_cmd_.setZero();
       last_u_prev_valid_ = false;
+
+      // 2) 关键：清 solver（老版本用 clearSolver + clearHessian/clearA 即可）
+      primary_solver_.clearSolver();
+      if (primary_solver_.data()) {
+        primary_solver_.data()->clearHessianMatrix();
+        primary_solver_.data()->clearLinearConstraintsMatrix();
+      }
+
+      secondary_solver_.clearSolver();
+      if (secondary_solver_.data()) {
+        secondary_solver_.data()->clearHessianMatrix();
+        secondary_solver_.data()->clearLinearConstraintsMatrix();
+      }
     }
+
 
     // 主入口：计算力矩控制项 u（7x1）。
     // 在 CartesianImpedanceController 中的推荐用法：
@@ -393,12 +390,17 @@ namespace serl_franka_controllers
 
       {
         PrimaryQP qp1 = buildPrimaryQP(in, p0, Vd_seq);
+        auto t0 = std::chrono::steady_clock::now();
         status1 = solveOSQPPrimary(qp1, &sol1_x);
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = 1e3 * std::chrono::duration<double>(t1 - t0).count();
+        ROS_WARN_THROTTLE(1.0, "OSQP primary solve wall-time: %.3f ms", ms);
+
         if (status1 == 1 && sol1_x.size() == qp1.nvar)
         {
           // 取 u_primary = k=0 时刻的第一个控制量
-          const int state_vars = (params_.Nt + 1) * GMPCParams::Nx;
-          u_primary = sol1_x.segment(state_vars, GMPCParams::Nu);
+          const int state_vars = (params_.Nt + 1) * params_.Nx;
+          u_primary = sol1_x.segment(state_vars, params_.Nu);
         }
         else
         {
@@ -522,7 +524,7 @@ namespace serl_franka_controllers
                              const Eigen::Matrix<double, 12, 1> &p0,
                              const std::vector<Eigen::Matrix<double, 6, 1>> &Vd_seq)
     {
-      const int Nx = GMPCParams::Nx;
+      const int Nx = params_.Nx;
       const int Nu = GMPCParams::Nu;
       const int Nt = params_.Nt;
       const double dt = params_.dt;
@@ -889,7 +891,7 @@ namespace serl_franka_controllers
 
       // 从完整解中提取主层的 u 序列：
       // 主层解排布为 [X(0..Nt); U(0..Nt-1)]
-      const int state_vars = (params_.Nt + 1) * GMPCParams::Nx;
+      const int state_vars = (params_.Nt + 1) * params_.Nx;
       const int control_vars = GMPCParams::Nu * params_.Nt;
       if (fs.full_solution.size() < state_vars + control_vars)
       {
@@ -1181,7 +1183,7 @@ namespace serl_franka_controllers
         secondary_solver_.settings()->setVerbosity(false);
         secondary_solver_.settings()->setWarmStart(true);
         secondary_solver_.settings()->setMaxIteration(3000);
-        primary_solver_.settings()->setAbsoluteTolerance(1e-6);
+        secondary_solver_.settings()->setAbsoluteTolerance(1e-6);
         secondary_solver_.settings()->setRelativeTolerance(1e-5);
         secondary_solver_.settings()->setAdaptiveRho(true);
         secondary_solver_.settings()->setAbsoluteTolerance(1e-5);
@@ -1256,6 +1258,7 @@ namespace serl_franka_controllers
       }
     }
 
+  
   private:
     mutable std::mutex mutex_;
     GMPCParams params_;

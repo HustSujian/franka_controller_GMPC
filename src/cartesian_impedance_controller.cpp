@@ -116,8 +116,6 @@ bool CartesianImpedanceController::init(hardware_interface::RobotHW* robot_hw,
   gmpc_params_.Nt = 10;
   gmpc_params_.dt = 0.001; // will be overwritten in update() by period
   gmpc_.setParams(gmpc_params_);
-  gmpc_.reset();
-
 
   return true;
 }
@@ -150,6 +148,8 @@ void CartesianImpedanceController::starting(const ros::Time& /*time*/) {
 void CartesianImpedanceController::update(const ros::Time& time,
                                                  const ros::Duration& period) {
   // get state variables
+  ROS_WARN_THROTTLE(1.0, "update() alive, period=%.6f", period.toSec());
+
   franka::RobotState robot_state = state_handle_->getRobotState();
   std::array<double, 7> coriolis_array = model_handle_->getCoriolis();
   jacobian_array =
@@ -224,7 +224,6 @@ void CartesianImpedanceController::update(const ros::Time& time,
   // 与 Jacobian.cpp 不同：
   //   - Jacobian.cpp 使用 Pinocchio: computeMinverse(), computeCoriolisMatrix(), computeGeneralizedGravity()
   //   - 本代码使用 franka_ros: model_handle_->getMass(), getCoriolis(), getGravity()
-  // 优点：franka_ros 提供的参数基于真实机器人标定，精度更高
   std::array<double, 49> mass_array = model_handle_->getMass();       // 7x7 质量矩阵 M(q)
   std::array<double, 7> gravity_array = model_handle_->getGravity();  // 7x1 重力向量 G(q)
 
@@ -232,9 +231,9 @@ void CartesianImpedanceController::update(const ros::Time& time,
   Eigen::Matrix<double, 7, 1> G = Eigen::Map<Eigen::Matrix<double, 7, 1>>(gravity_array.data());
 
   // 获取实际控制周期
-  double dt = 0.001;
-  if (period.toSec() > 1e-6 && period.toSec() < 0.1)
-    dt = period.toSec();
+  double dt = 0.005;
+  // if (period.toSec() > 1e-6 && period.toSec() < 0.1)
+  //   dt = period.toSec();
 
   // 计算Jdot（有限差分法）
   // 注意：Franka 不提供 Jdot 接口，也不支持 Pinocchio
@@ -253,48 +252,18 @@ void CartesianImpedanceController::update(const ros::Time& time,
   xd0.v.setZero();
   
   if (use_trajectory_) {
-    // 使用螺旋轨迹生成（参考 Jacobian.cpp）
-    // 注意：这里的轨迹生成函数在 gmpc_dual_layer.cpp 中是 static 的
-    // 因此我们在这里直接计算当前期望状态
-    double T = 30.0;  // 总周期
-    double t_in_period = std::fmod(t_total_, T);
-    
-    double radius = 0.4;
-    double height = 0.2;
-    double turns = 0.6;
-    double t_end = 30.0;
-    
-    // 位置（螺旋轨迹）
-    double x = radius * std::cos(2 * M_PI * turns * t_in_period / t_end);
-    double y = 0 + radius * std::sin(2 * M_PI * turns * t_in_period / t_end);
-    double z = 0.9 + height * t_in_period / t_end;
-    
-    // 速度
-    double x_d = -radius * (2 * M_PI * turns) / t_end * std::sin(2 * M_PI * turns * t_in_period / t_end);
-    double y_d =  radius * (2 * M_PI * turns) / t_end * std::cos(2 * M_PI * turns * t_in_period / t_end);
-    double z_d = height / t_end;
-    
-    // 四元数（保持恒定姿态）
-    Eigen::Vector4d q0(0.6, 0, 0, 0.8);
-    q0.normalize();
-    
-    xd0.v(0) = q0(0);  // qw
-    xd0.v(1) = q0(1);  // qx
-    xd0.v(2) = q0(2);  // qy
-    xd0.v(3) = q0(3);  // qz
-    xd0.v(4) = x;      // px
-    xd0.v(5) = y;      // py
-    xd0.v(6) = z;      // pz
-    xd0.v(7) = 0;      // wx
-    xd0.v(8) = 0;      // wy
-    xd0.v(9) = 0;      // wz
-    xd0.v(10) = x_d;   // vx
-    xd0.v(11) = y_d;   // vy
-    xd0.v(12) = z_d;   // vz
-    
-    ROS_INFO_THROTTLE(2.0, "Trajectory mode | t=%.2f | pos=[%.3f, %.3f, %.3f] | vel=[%.3f, %.3f, %.3f]",
-                      t_in_period, x, y, z, x_d, y_d, z_d);
-  } else {
+    const double T = 20.0;
+    const double t_in_period = std::fmod(t_total_, T);
+    serl_franka_controllers::buildSpiralDesiredState13(t_in_period, &xd0);
+  
+    ROS_INFO_THROTTLE(2.0,
+      "Trajectory mode | t=%.2f | pos=[%.3f, %.3f, %.3f] | vel=[%.3f, %.3f, %.3f]",
+      t_in_period,
+      xd0.v(4), xd0.v(5), xd0.v(6),
+      xd0.v(10), xd0.v(11), xd0.v(12));//3
+
+  } 
+  else {
     // 固定点跟踪模式
     xd0.v(0) = orientation_d_.w();
     xd0.v(1) = orientation_d_.x();
@@ -304,6 +273,7 @@ void CartesianImpedanceController::update(const ros::Time& time,
     xd0.v(5) = position_d_(1);
     xd0.v(6) = position_d_(2);
     // xd0.v(7..12) = 0 (已经通过 setZero() 设置)
+    ROS_INFO_THROTTLE(3.0, "Fixed trajectory mode");
   }
 
   // 更新GMPC时间步长
@@ -333,14 +303,15 @@ void CartesianImpedanceController::update(const ros::Time& time,
   else
   {
     // GMPC成功，使用GMPC输出
-    // 注意：tau_u是纯控制项，需要加上coriolis补偿（包含重力）
-    tau_d_cmd = tau_u + coriolis;
+
+    // tau_d_cmd = tau_u + coriolis + G;
+    tau_d_cmd = tau_u;
     
     // 更新时间（用于轨迹生成）
     t_total_ += dt;
     
     // 调试信息（每秒打印一次）
-    ROS_INFO_THROTTLE(1.0, "GMPC active | tau_norm: %.3f | position_error: [%.3f, %.3f, %.3f]",
+    ROS_INFO_THROTTLE(0.1, "GMPC active | tau_norm: %.3f | position_error: [%.3f, %.3f, %.3f]",
                       tau_u.norm(),
                       error_(0), error_(1), error_(2));
   }

@@ -4,6 +4,11 @@ project(serl_franka_controllers)
 set(CMAKE_BUILD_TYPE Release)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_PREFIX_PATH "${CMAKE_PREFIX_PATH}:/home/sujian/project/osqp-eigen/lib/cmake/osqp-eigen")
+set(CMAKE_PREFIX_PATH "${CMAKE_PREFIX_PATH}:${HOME}/opt/osqp/lib/cmake/osqp")
+set(osqp_DIR "/home/sujian/opt/osqp/lib/cmake/osqp")
+
+
 
 find_package(catkin REQUIRED COMPONENTS
   controller_interface
@@ -21,6 +26,9 @@ find_package(catkin REQUIRED COMPONENTS
   roscpp
   rospy
 )
+#find_package(Boost REQUIRED PATHS /usr/include/boost)
+
+find_package(osqp REQUIRED)
 find_package(OsqpEigen REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(Franka 0.7.0 REQUIRED)

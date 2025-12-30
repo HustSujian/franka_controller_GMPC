@@ -55,7 +55,7 @@ class CartesianImpedanceController : public controller_interface::MultiInterface
   bool J_prev_valid_ = false;
 
   // 轨迹生成参数
-  double t_total_ = 0.0;           // 总运行时间
+  double t_total_ = 20.0;           // 总运行时间
   bool use_trajectory_ = false;    // 是否使用轨迹跟踪（false=固定点）
 
 
