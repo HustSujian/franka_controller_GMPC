@@ -113,8 +113,8 @@ bool CartesianImpedanceController::init(hardware_interface::RobotHW* robot_hw,
   cartesian_damping_.setZero();
 
     // ===== GMPC params init =====
-  gmpc_params_.Nt = 10;
-  gmpc_params_.dt = 0.001; // will be overwritten in update() by period
+  // gmpc_params_.Nt = 10;
+  gmpc_params_.dt = 0.005; // will be overwritten in update() by period
   gmpc_.setParams(gmpc_params_);
 
   return true;
@@ -148,7 +148,7 @@ void CartesianImpedanceController::starting(const ros::Time& /*time*/) {
 void CartesianImpedanceController::update(const ros::Time& time,
                                                  const ros::Duration& period) {
   // get state variables
-  ROS_WARN_THROTTLE(1.0, "update() alive, period=%.6f", period.toSec());
+  ROS_WARN_THROTTLE(0.1, "update() alive, period=%.6f", period.toSec());
 
   franka::RobotState robot_state = state_handle_->getRobotState();
   std::array<double, 7> coriolis_array = model_handle_->getCoriolis();
@@ -256,7 +256,7 @@ void CartesianImpedanceController::update(const ros::Time& time,
     const double t_in_period = std::fmod(t_total_, T);
     serl_franka_controllers::buildSpiralDesiredState13(t_in_period, &xd0);
   
-    ROS_INFO_THROTTLE(2.0,
+    ROS_INFO_THROTTLE(0.1,
       "Trajectory mode | t=%.2f | pos=[%.3f, %.3f, %.3f] | vel=[%.3f, %.3f, %.3f]",
       t_in_period,
       xd0.v(4), xd0.v(5), xd0.v(6),
@@ -272,6 +272,24 @@ void CartesianImpedanceController::update(const ros::Time& time,
     xd0.v(4) = position_d_(0);
     xd0.v(5) = position_d_(1);
     xd0.v(6) = position_d_(2);
+    // 1) 期望姿态（四元数：w x y z）
+    // xd0.v(0) = 1.0;
+    // xd0.v(1) = 0.0;
+    // xd0.v(2) = 0.0;
+    // xd0.v(3) = 0.0;
+
+    ROS_INFO_THROTTLE(0.1,
+    "[GMPC][Fixed] qd (wxyz) = [%.6f %.6f %.6f %.6f]",
+    xd0.v(0), xd0.v(1), xd0.v(2), xd0.v(3));
+
+    // ROS_INFO_THROTTLE(0.1,
+    // "[GMPC][Fixed] qd (wxyz) = [%.6f %.6f %.6f %.6f %.6f %.6f %.6f]",
+    // xd0.v(0), xd0.v(1), xd0.v(2), xd0.v(3), xd0.v(4), xd0.v(5), xd0.v(6));
+
+    // // 2) 期望位置（单位 m）
+    xd0.v(4) = 0.3;
+    xd0.v(5) = 0.0;
+    xd0.v(6) = 0.6;
     // xd0.v(7..12) = 0 (已经通过 setZero() 设置)
     ROS_INFO_THROTTLE(3.0, "Fixed trajectory mode");
   }
@@ -311,9 +329,11 @@ void CartesianImpedanceController::update(const ros::Time& time,
     t_total_ += dt;
     
     // 调试信息（每秒打印一次）
-    ROS_INFO_THROTTLE(0.1, "GMPC active | tau_norm: %.3f | position_error: [%.3f, %.3f, %.3f]",
-                      tau_u.norm(),
-                      error_(0), error_(1), error_(2));
+    ROS_INFO_THROTTLE(
+    0.1, "GMPC active | tau: [%.3f %.3f %.3f %.3f %.3f %.3f %.3f] | pos_err: [%.3f %.3f %.3f]",
+    tau_u(0), tau_u(1), tau_u(2), tau_u(3), tau_u(4), tau_u(5), tau_u(6),
+    error_(0), error_(1), error_(2));
+
   }
 
   // 力矩变化率限制（安全机制）

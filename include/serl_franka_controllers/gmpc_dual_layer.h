@@ -19,7 +19,6 @@
 namespace serl_franka_controllers {
 
 
-
 // ===============================
 // GMPCParams：可调参数（与 .cpp 兼容）
 // ===============================
@@ -28,17 +27,17 @@ struct GMPCParams
   // 维度（固定）
   static constexpr int Nx = 12; // state: [phi(6); V(6)]
   static constexpr int Nu = 7;  // input: joint torque
-  int Nt = 10;                  // horizon
-  double dt = 0.001;            // sampling time
+  int Nt = 20;                  // horizon
+  double dt = 0.005;            // sampling time
 
   // ------------------------------
   // 主层代价权重
   // ------------------------------
   Eigen::Matrix<double, Nx, Nx> Q = Eigen::Matrix<double, Nx, Nx>::Identity();
   Eigen::Matrix<double, Nx, Nx> P = Eigen::Matrix<double, Nx, Nx>::Identity();
-  Eigen::Matrix<double, Nu, Nu> R = 1e-8 * Eigen::Matrix<double, Nu, Nu>::Identity();
+  Eigen::Matrix<double, Nu, Nu> R = Eigen::Matrix<double, Nu, Nu>::Identity();
 
-  // 可选：Δu 权重（cpp 用到了）
+  // 可选：Δu 权重
   bool use_R_delta = false;
   Eigen::Matrix<double, Nu, Nu> R_delta = Eigen::Matrix<double, Nu, Nu>::Zero();
   Eigen::Matrix<double, Nu, Nu> R_cross = Eigen::Matrix<double, Nu, Nu>::Zero();
@@ -61,7 +60,7 @@ struct GMPCParams
   Eigen::Matrix<double, Nx, 1> xmin = (-10.0) * Eigen::Matrix<double, Nx, 1>::Ones();
   Eigen::Matrix<double, Nx, 1> xmax = ( 10.0) * Eigen::Matrix<double, Nx, 1>::Ones();
 
-  // 可选：分块约束（cpp 用到了）
+  // 可选：分块约束
   Eigen::Matrix<double, 3, 1> xmin_rot = (-10.0) * Eigen::Matrix<double, 3, 1>::Ones();
   Eigen::Matrix<double, 3, 1> xmax_rot = ( 10.0) * Eigen::Matrix<double, 3, 1>::Ones();
 
@@ -82,30 +81,23 @@ struct GMPCParams
 
   GMPCParams()
   {
-    // 这里给一个“与你之前 .h 版本一致”的默认权重（可按需删/改）
+    
     Q.setZero();
     Q.block<3,3>(0,0) = 20.0 * Eigen::Matrix3d::Identity();
-    Q.block<3,3>(3,3) = 20.0 * Eigen::Matrix3d::Identity();
-    Q.block<6,6>(6,6) = 800.0 * Eigen::Matrix<double,6,6>::Identity();
+    Q.block<3,3>(3,3) = 1500.0 * Eigen::Matrix3d::Identity();
+    Q.block<6,6>(6,6) = 20.0 * Eigen::Matrix<double,6,6>::Identity();
 
     R.setZero();
-    R.diagonal().setConstant(1e-8);
+    R.diagonal().setConstant(1e-6);
 
     P = 10.0 * Q;
 
     // null 权重（按你之前那组）
     R_null.setZero();
-    R_null <<
-      0.1,0,0,0,0,0,0,
-      0,1.0,0,0,0,0,0,
-      0,0,1.0,0,0,0,0,
-      0,0,0,1.0,0,0,0,
-      0,0,0,0,0.1,0,0,
-      0,0,0,0,0,0.1,0,
-      0,0,0,0,0,0,0.1;
+    // R_null.diagonal() << 0.1, 1.0, 1.0, 1.0, 0.1, 0.1, 0.1;
 
-    // Franka 关节力矩安全范围（你原来用的）
-    umax << 50, 50, 50, 28, 28, 28, 28;
+    // Franka 关节力矩安全范围
+    umax << 87, 87, 87, 87, 12, 12, 12;
     umin = -umax;
   }
 };

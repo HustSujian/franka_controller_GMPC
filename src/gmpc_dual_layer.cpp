@@ -246,7 +246,8 @@ namespace serl_franka_controllers
     const double y_d =  radius * (2 * M_PI * turns) / t_end * std::cos(2 * M_PI * turns * t / t_end);
     const double z_d =  height / t_end;
 
-    Eigen::Vector4d q0(0.6, 0, 0, 0.8);
+    // Eigen::Vector4d q0(0.6, 0, 0, 0.8);
+    Eigen::Vector4d q0(1, 0, 0, 0);
     q0.normalize();
 
     xd0->v(0)=q0(0); xd0->v(1)=q0(1); xd0->v(2)=q0(2); xd0->v(3)=q0(3);
@@ -336,7 +337,7 @@ namespace serl_franka_controllers
     // 主入口：计算力矩控制项 u（7x1）。
     // 在 CartesianImpedanceController 中的推荐用法：
     //   u = gmpc.computeTau(in);
-    //   tau_cmd = u + coriolis; （随后再做力矩变化率饱和）
+  
     Eigen::Matrix<double, 7, 1> computeTau(const GMPCInput &in)
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -354,8 +355,12 @@ namespace serl_franka_controllers
       Eigen::Matrix<double, 12, 1> p0;
       p0 << phi, V_cur;
 
-      // 预测时域的期望 twist 轨迹：沿用 MATLAB xid(k,:) = 期望 twist 样本。
-      // 这里简化为时域内常值，可替换为外部提供的序列。
+      ROS_INFO_THROTTLE(0.1,
+      "GMPC p0 | phi=[%.3f %.3f %.3f %.3f %.3f %.3f] | V=[%.3f %.3f %.3f %.3f %.3f %.3f]",
+      p0(0), p0(1), p0(2), p0(3), p0(4), p0(5),
+      p0(6), p0(7), p0(8), p0(9), p0(10), p0(11));
+
+      // 预测时域的期望 twist 轨迹：沿用 MATLAB xid(k,:) = 期望 twist 样本
       std::vector<Eigen::Matrix<double, 6, 1>> Vd_seq(params_.Nt);
       for (int k = 0; k < params_.Nt; ++k)
         Vd_seq[k] = in.Vd;
@@ -401,6 +406,11 @@ namespace serl_franka_controllers
           // 取 u_primary = k=0 时刻的第一个控制量
           const int state_vars = (params_.Nt + 1) * params_.Nx;
           u_primary = sol1_x.segment(state_vars, params_.Nu);
+
+          ROS_INFO_THROTTLE(0.1,
+          "[GMPC][Primary] u_primary = [%.3f %.3f %.3f %.3f %.3f %.3f %.3f]",
+          u_primary(0), u_primary(1), u_primary(2),
+          u_primary(3), u_primary(4), u_primary(5), u_primary(6));
         }
         else
         {
@@ -434,10 +444,17 @@ namespace serl_franka_controllers
           // sol2 形如 [u0; u1; ... u_{Nt-1}]（Nu*Nt）
           u_final = sol2_x.segment(0, GMPCParams::Nu);
 
-          // 性能下降检查（同 MATLAB 思路）
+          ROS_INFO_THROTTLE(0.1,
+          "[GMPC][Secondary] u_final = [%.3f %.3f %.3f %.3f %.3f %.3f %.3f]",
+          u_final(0), u_final(1), u_final(2),
+          u_final(3), u_final(4), u_final(5), u_final(6));
+
+          // 性能下降检查
           const double degr = evaluatePerformanceDegradation(u_final, u_primary);
           if (degr > (1.0 - fs.alpha))
           {
+            ROS_WARN_THROTTLE(0.1,
+           "[GMPC][Secondary] performance degraded (degr=%.3f > %.3f), keep PRIMARY solution", degr, (1.0 - fs.alpha));
             // 下降过大则保留主层解
             u_final = u_primary;
           }
@@ -448,7 +465,7 @@ namespace serl_franka_controllers
         }
       }
 
-      // 力矩限幅（参考Jacobian.cpp的安全保护）
+      // 力矩限幅
       for (int i = 0; i < GMPCParams::Nu; ++i)
       {
         u_final(i) = std::min(std::max(u_final(i), params_.umin(i)), params_.umax(i));
@@ -707,7 +724,7 @@ namespace serl_franka_controllers
       const Eigen::Matrix<double, 6, 7> F = J * Minv; // J*M^{-1}
 
       // b_aff = Jdot*dq - J*M^{-1}*(coriolis+gravity)
-      // 注意：Franka的coriolis已包含重力，但这里分离G用于显式处理
+
       const Eigen::Matrix<double, 7, 1> tau_bias = in.coriolis + in.gravity;
       const Eigen::Matrix<double, 6, 1> b_aff = (Jdot * in.dq) - (J * (Minv * tau_bias));
 
@@ -1080,7 +1097,7 @@ namespace serl_franka_controllers
       if (!primary_initialized_)
       {
         // 参考 Jacobian.cpp 中验证有效的求解器设置
-        primary_solver_.settings()->setVerbosity(false);
+        primary_solver_.settings()->setVerbosity(true);
         primary_solver_.settings()->setWarmStart(true);
         primary_solver_.settings()->setMaxIteration(5000);
         primary_solver_.settings()->setAbsoluteTolerance(1e-6);
@@ -1186,8 +1203,6 @@ namespace serl_franka_controllers
         secondary_solver_.settings()->setAbsoluteTolerance(1e-6);
         secondary_solver_.settings()->setRelativeTolerance(1e-5);
         secondary_solver_.settings()->setAdaptiveRho(true);
-        secondary_solver_.settings()->setAbsoluteTolerance(1e-5);
-        secondary_solver_.settings()->setRelativeTolerance(1e-5);
         secondary_solver_.settings()->setPolish(true);
 
         secondary_solver_.data()->setNumberOfVariables(qp.nvar);
