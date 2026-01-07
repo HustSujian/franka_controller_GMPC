@@ -161,6 +161,135 @@ namespace serl_franka_controllers
     return phi;
   }
 
+  static inline Eigen::Matrix<double,6,6> adjointSE3(const Eigen::Matrix4d& T)
+{
+  Eigen::Matrix<double,6,6> Ad = Eigen::Matrix<double,6,6>::Zero();
+  Eigen::Matrix3d R = T.block<3,3>(0,0);
+  Eigen::Vector3d p = T.block<3,1>(0,3);
+
+  Eigen::Matrix3d p_hat;
+  p_hat <<   0,   -p.z(),  p.y(),
+          p.z(),     0,   -p.x(),
+         -p.y(),  p.x(),     0;
+
+  // V = [w; v] 约定下：Ad = [[R,0],[p_hat*R, R]]
+  Ad.block<3,3>(0,0) = R;
+  Ad.block<3,3>(3,3) = R;
+  Ad.block<3,3>(3,0) = p_hat * R;
+  return Ad;
+}
+
+static inline Eigen::Matrix<double,7,1> coriolisForceFuncFranka(
+    const franka_hw::FrankaModelHandle& model,
+    const franka::RobotState& rs,   // 用来提供 I_total, m_total, F_x_Ctotal
+    const Eigen::Matrix<double,7,1>& q,
+    const Eigen::Matrix<double,7,1>& dq) {
+
+  std::array<double,7> q_arr, dq_arr;
+  for (int i=0;i<7;++i) { q_arr[i]=q(i); dq_arr[i]=dq(i); }
+
+  // 这个重载仍然返回 7x1 的 c = C*dq
+  const std::array<double,7> c_arr =
+      model.getCoriolis(q_arr, dq_arr, rs.I_total, rs.m_total, rs.F_x_Ctotal); // :contentReference[oaicite:3]{index=3}
+
+  Eigen::Matrix<double,7,1> c;
+  for (int i=0;i<7;++i) c(i)=c_arr[i];
+  return c;
+}
+
+static inline Eigen::Matrix<double,7,7> CoriolisMatrixFromFranka(
+    const franka_hw::FrankaModelHandle& model,
+    const franka::RobotState& rs,
+    const Eigen::Matrix<double,7,1>& q,
+    const Eigen::Matrix<double,7,1>& qd) {
+
+  constexpr int N = 7;
+  Eigen::Matrix<double,N,N> C   = Eigen::Matrix<double,N,N>::Zero();
+  Eigen::Matrix<double,N,N> Csq = Eigen::Matrix<double,N,N>::Zero();
+
+  // 1) 计算“离心项列”：Csq(:,j) = c(q, e_j)
+  for (int j = 0; j < N; ++j) {
+    Eigen::Matrix<double,N,1> QD = Eigen::Matrix<double,N,1>::Zero();
+    QD(j) = 1.0;
+    Eigen::Matrix<double,N,1> tau = coriolisForceFuncFranka(model, rs, q, QD);
+    Csq.col(j) = tau;
+  }
+
+  // 2) 计算非对角“科氏项”贡献：使用 c(q, e_j+e_k) 的交叉项
+  for (int j = 0; j < N; ++j) {
+    for (int k = j + 1; k < N; ++k) {
+      Eigen::Matrix<double,N,1> QD = Eigen::Matrix<double,N,1>::Zero();
+      QD(j) = 1.0;
+      QD(k) = 1.0;
+
+      Eigen::Matrix<double,N,1> tau = coriolisForceFuncFranka(model, rs, q, QD);
+      const Eigen::Matrix<double,N,1> cross = (tau - Csq.col(k) - Csq.col(j));
+
+      // 注意：这里完全沿用你原公式（乘以当前 qd 的分量）
+      C.col(k) += cross * (qd(j) / 2.0);
+      C.col(j) += cross * (qd(k) / 2.0);
+    }
+  }
+
+  // 3) 添加离心项：Csq * diag(qd)
+  C += Csq * qd.asDiagonal();
+  return C;
+}
+
+Eigen::Matrix<double,7,7> GMPCDualLayer::CoriolisMatrixFromFranka(
+    const Eigen::Matrix<double,7,1>& q,
+    const Eigen::Matrix<double,7,1>& qd) const
+{
+  constexpr int N = 7;
+  Eigen::Matrix<double,N,N> Cmat = Eigen::Matrix<double,N,N>::Zero();
+  Eigen::Matrix<double,N,N> Csq  = Eigen::Matrix<double,N,N>::Zero();
+
+  auto coriolis_vec = [&](const Eigen::Matrix<double,N,1>& dq_test) -> Eigen::Matrix<double,N,1> {
+    // 需要 model_handle_ + robot_state_ 提供负载参数
+    std::array<double,7> q_arr, dq_arr;
+    for (int i = 0; i < N; ++i) { q_arr[i] = q(i); dq_arr[i] = dq_test(i); }
+
+    const std::array<double,7> c_arr =
+        model_handle_->getCoriolis(q_arr, dq_arr,
+                                   robot_state_.I_total,
+                                   robot_state_.m_total,
+                                   robot_state_.F_x_Ctotal);
+
+    Eigen::Matrix<double,N,1> c;
+    for (int i = 0; i < N; ++i) c(i) = c_arr[i];
+    return c;
+  };
+
+  // 1) “离心项”列：Csq(:,j) = c(q, e_j)
+  for (int j = 0; j < N; ++j) {
+    Eigen::Matrix<double,N,1> dq_test = Eigen::Matrix<double,N,1>::Zero();
+    dq_test(j) = 1.0;
+    Csq.col(j) = coriolis_vec(dq_test);
+  }
+
+  // 2) 交叉项（科氏项）：用 c(q, e_j + e_k) 的二阶组合
+  for (int j = 0; j < N; ++j) {
+    for (int k = j + 1; k < N; ++k) {
+      Eigen::Matrix<double,N,1> dq_test = Eigen::Matrix<double,N,1>::Zero();
+      dq_test(j) = 1.0;
+      dq_test(k) = 1.0;
+
+      const Eigen::Matrix<double,N,1> tau = coriolis_vec(dq_test);
+      const Eigen::Matrix<double,N,1> cross = (tau - Csq.col(k) - Csq.col(j));
+
+      // 沿用你原公式：把交叉项按当前 qd 分量分配到 C 的列
+      Cmat.col(k) += cross * (qd(j) / 2.0);
+      Cmat.col(j) += cross * (qd(k) / 2.0);
+    }
+  }
+
+  // 3) 加离心项：Csq * diag(qd)
+  Cmat += Csq * qd.asDiagonal();
+
+  return Cmat;
+}
+
+
   // 位姿转齐次变换矩阵：将四元数和位置组合为4x4变换矩阵
   // 输入：q=四元数姿态, p=3维位置向量
   // 输出：4x4齐次变换矩阵T，左上3x3为旋转矩阵，右上3x1为平移向量
@@ -284,6 +413,9 @@ namespace serl_franka_controllers
 
     // 基座系雅可比及可选的 Jdot 估计
     Eigen::Matrix<double, 6, 7> J;
+
+    Eigen::Matrix<double, 7, 7> Cmat = Eigen::Matrix<double,7,7>::Zero();
+    Eigen::Matrix<double, 6, 7> Jdot = Eigen::Matrix<double,6,7>::Zero();
   };
 
   // ------------------------------ 双层 GMPC 求解器 ------------------------------
@@ -351,9 +483,14 @@ namespace serl_franka_controllers
 
       const Eigen::Matrix<double, 6, 1> phi = se3LogPhi(T_err);
       const Eigen::Matrix<double, 6, 1> V_cur = in.J * in.dq;
+      const Eigen::Matrix<double, 6, 1> V_body = adjointSE3(T_cur.inverse()) * V_spatial;  // 换成body雅可比就不用这一步
 
       Eigen::Matrix<double, 12, 1> p0;
       p0 << phi, V_cur;
+      // p0 << phi, V_body;   //这个修复在 “in.J 是 spatial Jacobian（基座/世界系表达）” 的前提下是正确的
+
+      ROS_INFO_THROTTLE(0.1, "V_spatial norm=%.3f, V_body norm=%.3f",
+                  V_spatial.norm(), V_body.norm());
 
       ROS_INFO_THROTTLE(0.1,
       "GMPC p0 | phi=[%.3f %.3f %.3f %.3f %.3f %.3f] | V=[%.3f %.3f %.3f %.3f %.3f %.3f]",
@@ -564,7 +701,7 @@ namespace serl_franka_controllers
       qp.nvar = nvar;
       qp.ncon = ncon;
 
-      // --------- 组装 H 与 g（代价） ---------
+      // --------- 组装 H 与 g（代价函数） ---------
       // 参考 Jacobian.cpp 验证过的成本函数构建方式：
       // 对 k=1..Nt:
       //   C = I; C(7:12,1:6) = -ad(Vd_k)
@@ -580,7 +717,7 @@ namespace serl_franka_controllers
 
       for (int k = 1; k <= Nt; ++k)
       {
-        // 构造C矩阵（参考Jacobian.cpp中验证的方式）
+        // 构造C矩阵
         Eigen::Matrix<double, 12, 12> Cmap = Eigen::Matrix<double, 12, 12>::Identity();
         Cmap.block<6, 6>(6, 0) = -ad6(Vd_seq[std::min(k - 1, Nt - 1)]);
 
@@ -608,7 +745,7 @@ namespace serl_franka_controllers
         qp.g.segment(idx0, Nx) += gblk;
       }
 
-      // 控制代价：U 序列上块对角的 R（参考Jacobian.cpp）
+      // 控制代价：U 序列上块对角的 R
       const int u_offset = Nx * (Nt + 1);
       for (int k = 0; k < Nt; ++k)
       {
@@ -716,17 +853,18 @@ namespace serl_franka_controllers
       //  Ad = I + Ac*dt
       //  Bd = Bc*dt
       //  hd = hc*dt
-      //
+
       const Eigen::Matrix<double, 7, 7> Minv = in.M.inverse();
       const Eigen::Matrix<double, 6, 7> J = in.J;
       const Eigen::Matrix<double, 6, 7> Jdot = estimateJdot(in.J, dt);
+      const Eigen::Matrix<double, 7, 6> J_pinv = pseudoInvJ(J);
+      const Eigen::Matrix<double, 7, 7> C = in.Cmat;
 
       const Eigen::Matrix<double, 6, 7> F = J * Minv; // J*M^{-1}
 
-      // b_aff = Jdot*dq - J*M^{-1}*(coriolis+gravity)
+      const Eigen::Matrix<double, 6, 1> b_aff = -J * (Minv * in.gravity);
 
-      const Eigen::Matrix<double, 7, 1> tau_bias = in.coriolis + in.gravity;
-      const Eigen::Matrix<double, 6, 1> b_aff = (Jdot * in.dq) - (J * (Minv * tau_bias));
+      Eigen::Matrix<double, 6, 6> H = J * (Minv * (in.M * J_pinv * dot * J_pinv - C * J_pinv));
 
       // 常量矩阵
       const Eigen::Matrix<double, 6, 6> I6 = Eigen::Matrix<double, 6, 6>::Identity();
@@ -736,12 +874,11 @@ namespace serl_franka_controllers
       {
         const Eigen::Matrix<double, 6, 1> Vd = Vd_seq[k];
 
-        // 连续时间动力学矩阵（参考Jacobian.cpp）
+        // 连续时间动力学矩阵
         Eigen::Matrix<double, 12, 12> Ac = Eigen::Matrix<double, 12, 12>::Zero();
         Ac.block<6, 6>(0, 0) = -ad6(Vd);
         Ac.block<6, 6>(0, 6) = -I6;
-        // V的动力学：H矩阵（这里简化，可扩展加入更复杂的耦合）
-        // Ac.block<6,6>(6,6) = H; // 如需要可添加
+        Ac.block<6,6>(6,6) = H; 
 
         Eigen::Matrix<double, 12, 7> Bc = Eigen::Matrix<double, 12, 7>::Zero();
         Bc.block<6, 7>(6, 0) = F; // 只有V部分受控制输入影响
@@ -1392,6 +1529,8 @@ bool GMPCDualLayer::computeTauMPC(
   in.coriolis = C;
   in.gravity = G;
   in.J = J;
+  in.Jdot = Jdot;
+  in.Cmat = CoriolisMatrixFromFranka(q, dq);   // 下面我给你实现
 
   try
   {

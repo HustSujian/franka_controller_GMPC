@@ -146,6 +146,10 @@ public:
       const DesiredState13& xd0,
       Eigen::Matrix<double,7,1>* tau_cmd);
 
+  Eigen::Matrix<double,7,7> CoriolisMatrixFromFranka(
+    const Eigen::Matrix<double,7,1>& q,
+    const Eigen::Matrix<double,7,1>& dq) const;
+
 private:
   std::unique_ptr<DualLayerGMPC> impl_;
 };
