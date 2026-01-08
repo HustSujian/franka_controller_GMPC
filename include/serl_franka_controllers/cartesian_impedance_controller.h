@@ -46,7 +46,7 @@ class CartesianImpedanceController : public controller_interface::MultiInterface
   std::vector<hardware_interface::JointHandle> joint_handles_;
   std::array<double, 42> jacobian_array;
 
-    // ===== GMPC dual-layer solver =====
+  // ===== GMPC dual-layer solver =====
   serl_franka_controllers::GMPCDualLayer gmpc_;
   serl_franka_controllers::GMPCParams gmpc_params_;
 

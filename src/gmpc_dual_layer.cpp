@@ -11,10 +11,7 @@
 //
 // 注（Franka 实际应用）：
 // - Franka 通过 model handle 提供质量矩阵 M(q)、科里奥利向量 c(q,dq) 与重力 g(q)。
-// - 不提供科里奥利矩阵 C(q,dq)，Jdot 也无法直接获取。
-// - 因此采用仿射的 Vdot 模型：
-//     Vdot = J * M^{-1} * u  +  (Jdot*dq - J*M^{-1}(coriolis+gravity))
-//   并用有限差分估计 Jdot。
+
 #include "serl_franka_controllers/gmpc_dual_layer.h"
 #include <OsqpEigen/OsqpEigen.h>
 #include <ros/ros.h>
@@ -36,6 +33,8 @@
 #include <vector>
 
 #include <unsupported/Eigen/MatrixFunctions>
+#include <franka_hw/franka_model_interface.h> 
+
 
 namespace serl_franka_controllers
 {
@@ -162,132 +161,73 @@ namespace serl_franka_controllers
   }
 
   static inline Eigen::Matrix<double,6,6> adjointSE3(const Eigen::Matrix4d& T)
-{
-  Eigen::Matrix<double,6,6> Ad = Eigen::Matrix<double,6,6>::Zero();
-  Eigen::Matrix3d R = T.block<3,3>(0,0);
-  Eigen::Vector3d p = T.block<3,1>(0,3);
+  {
+    Eigen::Matrix<double,6,6> Ad = Eigen::Matrix<double,6,6>::Zero();
+    Eigen::Matrix3d R = T.block<3,3>(0,0);
+    Eigen::Vector3d p = T.block<3,1>(0,3);
 
-  Eigen::Matrix3d p_hat;
-  p_hat <<   0,   -p.z(),  p.y(),
-          p.z(),     0,   -p.x(),
-         -p.y(),  p.x(),     0;
+    Eigen::Matrix3d p_hat;
+    p_hat <<   0,   -p.z(),  p.y(),
+            p.z(),     0,   -p.x(),
+          -p.y(),  p.x(),     0;
 
-  // V = [w; v] 约定下：Ad = [[R,0],[p_hat*R, R]]
-  Ad.block<3,3>(0,0) = R;
-  Ad.block<3,3>(3,3) = R;
-  Ad.block<3,3>(3,0) = p_hat * R;
-  return Ad;
-}
-
-static inline Eigen::Matrix<double,7,1> coriolisForceFuncFranka(
-    const franka_hw::FrankaModelHandle& model,
-    const franka::RobotState& rs,   // 用来提供 I_total, m_total, F_x_Ctotal
-    const Eigen::Matrix<double,7,1>& q,
-    const Eigen::Matrix<double,7,1>& dq) {
-
-  std::array<double,7> q_arr, dq_arr;
-  for (int i=0;i<7;++i) { q_arr[i]=q(i); dq_arr[i]=dq(i); }
-
-  // 这个重载仍然返回 7x1 的 c = C*dq
-  const std::array<double,7> c_arr =
-      model.getCoriolis(q_arr, dq_arr, rs.I_total, rs.m_total, rs.F_x_Ctotal); // :contentReference[oaicite:3]{index=3}
-
-  Eigen::Matrix<double,7,1> c;
-  for (int i=0;i<7;++i) c(i)=c_arr[i];
-  return c;
-}
-
-static inline Eigen::Matrix<double,7,7> CoriolisMatrixFromFranka(
-    const franka_hw::FrankaModelHandle& model,
-    const franka::RobotState& rs,
-    const Eigen::Matrix<double,7,1>& q,
-    const Eigen::Matrix<double,7,1>& qd) {
-
-  constexpr int N = 7;
-  Eigen::Matrix<double,N,N> C   = Eigen::Matrix<double,N,N>::Zero();
-  Eigen::Matrix<double,N,N> Csq = Eigen::Matrix<double,N,N>::Zero();
-
-  // 1) 计算“离心项列”：Csq(:,j) = c(q, e_j)
-  for (int j = 0; j < N; ++j) {
-    Eigen::Matrix<double,N,1> QD = Eigen::Matrix<double,N,1>::Zero();
-    QD(j) = 1.0;
-    Eigen::Matrix<double,N,1> tau = coriolisForceFuncFranka(model, rs, q, QD);
-    Csq.col(j) = tau;
+    // V = [w; v] 约定下：Ad = [[R,0],[p_hat*R, R]]
+    Ad.block<3,3>(0,0) = R;
+    Ad.block<3,3>(3,3) = R;
+    Ad.block<3,3>(3,0) = p_hat * R;
+    return Ad;
   }
 
-  // 2) 计算非对角“科氏项”贡献：使用 c(q, e_j+e_k) 的交叉项
-  for (int j = 0; j < N; ++j) {
-    for (int k = j + 1; k < N; ++k) {
-      Eigen::Matrix<double,N,1> QD = Eigen::Matrix<double,N,1>::Zero();
-      QD(j) = 1.0;
-      QD(k) = 1.0;
 
-      Eigen::Matrix<double,N,1> tau = coriolisForceFuncFranka(model, rs, q, QD);
-      const Eigen::Matrix<double,N,1> cross = (tau - Csq.col(k) - Csq.col(j));
+  static inline Eigen::Matrix<double,7,7> CoriolisMatrixFromFranka(
+      const franka_hw::FrankaModelHandle& model,
+      const franka::RobotState& rs,
+      const Eigen::Matrix<double,7,1>& q,
+      const Eigen::Matrix<double,7,1>& qd)
+  {
+    constexpr int N = 7;
+    Eigen::Matrix<double,N,N> Cmat = Eigen::Matrix<double,N,N>::Zero();
+    Eigen::Matrix<double,N,N> Csq  = Eigen::Matrix<double,N,N>::Zero();
 
-      // 注意：这里完全沿用你原公式（乘以当前 qd 的分量）
-      C.col(k) += cross * (qd(j) / 2.0);
-      C.col(j) += cross * (qd(k) / 2.0);
-    }
-  }
+    auto coriolis_vec = [&](const Eigen::Matrix<double,N,1>& dq_test) -> Eigen::Matrix<double,N,1> {
+      std::array<double,7> q_arr{}, dq_arr{};
+      for (int i = 0; i < N; ++i) { q_arr[i] = q(i); dq_arr[i] = dq_test(i); }
 
-  // 3) 添加离心项：Csq * diag(qd)
-  C += Csq * qd.asDiagonal();
-  return C;
-}
+      const std::array<double,7> c_arr =
+          model.getCoriolis(q_arr, dq_arr, rs.I_total, rs.m_total, rs.F_x_Ctotal);
 
-Eigen::Matrix<double,7,7> GMPCDualLayer::CoriolisMatrixFromFranka(
-    const Eigen::Matrix<double,7,1>& q,
-    const Eigen::Matrix<double,7,1>& qd) const
-{
-  constexpr int N = 7;
-  Eigen::Matrix<double,N,N> Cmat = Eigen::Matrix<double,N,N>::Zero();
-  Eigen::Matrix<double,N,N> Csq  = Eigen::Matrix<double,N,N>::Zero();
+      Eigen::Matrix<double,N,1> c;
+      for (int i = 0; i < N; ++i) c(i) = c_arr[i];
+      return c;
+    };
 
-  auto coriolis_vec = [&](const Eigen::Matrix<double,N,1>& dq_test) -> Eigen::Matrix<double,N,1> {
-    // 需要 model_handle_ + robot_state_ 提供负载参数
-    std::array<double,7> q_arr, dq_arr;
-    for (int i = 0; i < N; ++i) { q_arr[i] = q(i); dq_arr[i] = dq_test(i); }
-
-    const std::array<double,7> c_arr =
-        model_handle_->getCoriolis(q_arr, dq_arr,
-                                   robot_state_.I_total,
-                                   robot_state_.m_total,
-                                   robot_state_.F_x_Ctotal);
-
-    Eigen::Matrix<double,N,1> c;
-    for (int i = 0; i < N; ++i) c(i) = c_arr[i];
-    return c;
-  };
-
-  // 1) “离心项”列：Csq(:,j) = c(q, e_j)
-  for (int j = 0; j < N; ++j) {
-    Eigen::Matrix<double,N,1> dq_test = Eigen::Matrix<double,N,1>::Zero();
-    dq_test(j) = 1.0;
-    Csq.col(j) = coriolis_vec(dq_test);
-  }
-
-  // 2) 交叉项（科氏项）：用 c(q, e_j + e_k) 的二阶组合
-  for (int j = 0; j < N; ++j) {
-    for (int k = j + 1; k < N; ++k) {
+    // 1) Csq(:,j) = c(q, e_j)
+    for (int j = 0; j < N; ++j) {
       Eigen::Matrix<double,N,1> dq_test = Eigen::Matrix<double,N,1>::Zero();
       dq_test(j) = 1.0;
-      dq_test(k) = 1.0;
-
-      const Eigen::Matrix<double,N,1> tau = coriolis_vec(dq_test);
-      const Eigen::Matrix<double,N,1> cross = (tau - Csq.col(k) - Csq.col(j));
-
-      // 沿用你原公式：把交叉项按当前 qd 分量分配到 C 的列
-      Cmat.col(k) += cross * (qd(j) / 2.0);
-      Cmat.col(j) += cross * (qd(k) / 2.0);
+      Csq.col(j) = coriolis_vec(dq_test);
     }
+
+    // 2) cross terms via c(q, e_j + e_k)
+    for (int j = 0; j < N; ++j) {
+      for (int k = j + 1; k < N; ++k) {
+        Eigen::Matrix<double,N,1> dq_test = Eigen::Matrix<double,N,1>::Zero();
+        dq_test(j) = 1.0;
+        dq_test(k) = 1.0;
+
+        const Eigen::Matrix<double,N,1> tau   = coriolis_vec(dq_test);
+        const Eigen::Matrix<double,N,1> cross = (tau - Csq.col(k) - Csq.col(j));
+
+        Cmat.col(k) += cross * (qd(j) / 2.0);
+        Cmat.col(j) += cross * (qd(k) / 2.0);
+      }
+    }
+
+    // 3) add centrifugal term
+    Cmat += Csq * qd.asDiagonal();
+    return Cmat;
   }
 
-  // 3) 加离心项：Csq * diag(qd)
-  Cmat += Csq * qd.asDiagonal();
-
-  return Cmat;
-}
 
 
   // 位姿转齐次变换矩阵：将四元数和位置组合为4x4变换矩阵
@@ -385,8 +325,6 @@ Eigen::Matrix<double,7,7> GMPCDualLayer::CoriolisMatrixFromFranka(
     xd0->v(10)=x_d; xd0->v(11)=y_d; xd0->v(12)=z_d;
   }
 
-
-
   // ------------------------------ 输入结构体 ------------------------------
 
   struct GMPCInput
@@ -483,14 +421,13 @@ Eigen::Matrix<double,7,7> GMPCDualLayer::CoriolisMatrixFromFranka(
 
       const Eigen::Matrix<double, 6, 1> phi = se3LogPhi(T_err);
       const Eigen::Matrix<double, 6, 1> V_cur = in.J * in.dq;
-      const Eigen::Matrix<double, 6, 1> V_body = adjointSE3(T_cur.inverse()) * V_spatial;  // 换成body雅可比就不用这一步
+      // const Eigen::Matrix<double, 6, 1> V_body = adjointSE3(T_cur.inverse()) * V_spatial;  // 换成body雅可比就不用这一步
 
       Eigen::Matrix<double, 12, 1> p0;
       p0 << phi, V_cur;
       // p0 << phi, V_body;   //这个修复在 “in.J 是 spatial Jacobian（基座/世界系表达）” 的前提下是正确的
 
-      ROS_INFO_THROTTLE(0.1, "V_spatial norm=%.3f, V_body norm=%.3f",
-                  V_spatial.norm(), V_body.norm());
+      // ROS_INFO_THROTTLE(0.1, "V_spatial norm=%.3f, V_body norm=%.3f", V_spatial.norm(), V_body.norm()); // 比较空间/body旋量
 
       ROS_INFO_THROTTLE(0.1,
       "GMPC p0 | phi=[%.3f %.3f %.3f %.3f %.3f %.3f] | V=[%.3f %.3f %.3f %.3f %.3f %.3f]",
@@ -499,8 +436,9 @@ Eigen::Matrix<double,7,7> GMPCDualLayer::CoriolisMatrixFromFranka(
 
       // 预测时域的期望 twist 轨迹：沿用 MATLAB xid(k,:) = 期望 twist 样本
       std::vector<Eigen::Matrix<double, 6, 1>> Vd_seq(params_.Nt);
-      for (int k = 0; k < params_.Nt; ++k)
+      for (int k = 0; k < params_.Nt; ++k){
         Vd_seq[k] = in.Vd;
+      }
 
       // ----------- 自适应阻尼与零空间投影 N -----------
       const double condJ = condNumber(in.J);
@@ -536,7 +474,7 @@ Eigen::Matrix<double,7,7> GMPCDualLayer::CoriolisMatrixFromFranka(
         status1 = solveOSQPPrimary(qp1, &sol1_x);
         auto t1 = std::chrono::steady_clock::now();
         double ms = 1e3 * std::chrono::duration<double>(t1 - t0).count();
-        ROS_WARN_THROTTLE(1.0, "OSQP primary solve wall-time: %.3f ms", ms);
+        ROS_WARN_THROTTLE(0.1, "OSQP primary solve wall-time: %.3f ms", ms);
 
         if (status1 == 1 && sol1_x.size() == qp1.nvar)
         {
@@ -860,11 +798,18 @@ Eigen::Matrix<double,7,7> GMPCDualLayer::CoriolisMatrixFromFranka(
       const Eigen::Matrix<double, 7, 6> J_pinv = pseudoInvJ(J);
       const Eigen::Matrix<double, 7, 7> C = in.Cmat;
 
+      Eigen::Matrix<double, 7, 7> Cmat = Eigen::Matrix<double, 7, 7>::Zero();
+      double eps = 1e-3;
+      for (int i = 0; i < 7; ++i)
+      {
+        Cmat(i, i) = in.coriolis(i) * in.dq(i) / (in.dq(i) * in.dq(i) + eps * eps);
+      }
+
       const Eigen::Matrix<double, 6, 7> F = J * Minv; // J*M^{-1}
 
       const Eigen::Matrix<double, 6, 1> b_aff = -J * (Minv * in.gravity);
 
-      Eigen::Matrix<double, 6, 6> H = J * (Minv * (in.M * J_pinv * dot * J_pinv - C * J_pinv));
+      Eigen::Matrix<double, 6, 6> H = J * (Minv * (in.M * J_pinv * dot * J_pinv - Cmat * J_pinv));
 
       // 常量矩阵
       const Eigen::Matrix<double, 6, 6> I6 = Eigen::Matrix<double, 6, 6>::Identity();
@@ -1495,6 +1440,8 @@ bool GMPCDualLayer::computeTauMPC(
     const Eigen::Matrix<double, 7, 7> &M,
     const Eigen::Matrix<double, 7, 1> &C,
     const Eigen::Matrix<double, 7, 1> &G,
+    const franka_hw::FrankaModelHandle& model_handle,
+    const franka::RobotState& robot_state,
     const DesiredState13 &xd0,
     Eigen::Matrix<double, 7, 1> *tau_cmd)
 {
@@ -1530,7 +1477,12 @@ bool GMPCDualLayer::computeTauMPC(
   in.gravity = G;
   in.J = J;
   in.Jdot = Jdot;
-  in.Cmat = CoriolisMatrixFromFranka(q, dq);   // 下面我给你实现
+
+  in.Cmat = CoriolisMatrixFromFranka(model_handle_, robot_state, q, dq);
+  const Eigen::Matrix<double,7,1> c_check = in.Cmat * in.dq;
+  if ((c_check - in.coriolis).norm() > 1e-3) {
+    // 打印一下，看看是否一致
+  }
 
   try
   {

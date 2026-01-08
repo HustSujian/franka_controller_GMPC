@@ -7,14 +7,14 @@
 // - 含 use_R_delta / R_delta / R_cross
 // - 含 xmin_rot/xmax_rot/xmin_pos/xmax_pos/xmin_vel/xmax_vel
 // - 含 du_max / du_cross_max
-//
-// 注意：不要在 .cpp 里再次定义 GMPCParams（会重复定义）
+
 // ====================================================================================
 
 #pragma once
 
 #include <Eigen/Dense>
 #include <memory>
+#include <franka/robot_state.h>
 
 namespace serl_franka_controllers {
 
@@ -143,12 +143,11 @@ public:
       const Eigen::Matrix<double,7,7>& M,
       const Eigen::Matrix<double,7,1>& C,
       const Eigen::Matrix<double,7,1>& G,
+      const franka_hw::FrankaModelHandle& model_handle,
+      const franka::RobotState& robot_state,
       const DesiredState13& xd0,
       Eigen::Matrix<double,7,1>* tau_cmd);
 
-  Eigen::Matrix<double,7,7> CoriolisMatrixFromFranka(
-    const Eigen::Matrix<double,7,1>& q,
-    const Eigen::Matrix<double,7,1>& dq) const;
 
 private:
   std::unique_ptr<DualLayerGMPC> impl_;
