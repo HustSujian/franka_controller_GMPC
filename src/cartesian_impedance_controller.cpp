@@ -286,8 +286,8 @@ void CartesianImpedanceController::update(const ros::Time& time,
 
     // // 2) 期望位置（单位 m）
     xd0.v(4) = 0.3;
-    xd0.v(5) = 0.0;
-    xd0.v(6) = 0.6;
+    xd0.v(5) = 0.2;
+    xd0.v(6) = 0.8;
     // xd0.v(7..12) = 0 (已经通过 setZero() 设置)
     ROS_INFO_THROTTLE(3.0, "Fixed trajectory mode");
   }

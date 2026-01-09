@@ -15,6 +15,9 @@
 #include <Eigen/Dense>
 #include <memory>
 #include <franka/robot_state.h>
+#include <franka_hw/franka_model_interface.h> 
+#include <serl_franka_controllers/csv_logger.h>
+
 
 namespace serl_franka_controllers {
 
@@ -64,11 +67,11 @@ struct GMPCParams
   Eigen::Matrix<double, 3, 1> xmin_rot = (-10.0) * Eigen::Matrix<double, 3, 1>::Ones();
   Eigen::Matrix<double, 3, 1> xmax_rot = ( 10.0) * Eigen::Matrix<double, 3, 1>::Ones();
 
-  Eigen::Matrix<double, 3, 1> xmin_pos = (-0.2) * Eigen::Matrix<double, 3, 1>::Ones();
-  Eigen::Matrix<double, 3, 1> xmax_pos = ( 0.2) * Eigen::Matrix<double, 3, 1>::Ones();
+  Eigen::Matrix<double, 3, 1> xmin_pos = (-20) * Eigen::Matrix<double, 3, 1>::Ones();
+  Eigen::Matrix<double, 3, 1> xmax_pos = ( 20) * Eigen::Matrix<double, 3, 1>::Ones();
 
-  Eigen::Matrix<double, 6, 1> xmin_vel = (-2.0) * Eigen::Matrix<double, 6, 1>::Ones();
-  Eigen::Matrix<double, 6, 1> xmax_vel = ( 2.0) * Eigen::Matrix<double, 6, 1>::Ones();
+  Eigen::Matrix<double, 6, 1> xmin_vel = (-20) * Eigen::Matrix<double, 6, 1>::Ones();
+  Eigen::Matrix<double, 6, 1> xmax_vel = ( 20) * Eigen::Matrix<double, 6, 1>::Ones();
 
   // ------------------------------
   // 副层参数
@@ -84,7 +87,7 @@ struct GMPCParams
     
     Q.setZero();
     Q.block<3,3>(0,0) = 20.0 * Eigen::Matrix3d::Identity();
-    Q.block<3,3>(3,3) = 1500.0 * Eigen::Matrix3d::Identity();
+    Q.block<3,3>(3,3) = 150.0 * Eigen::Matrix3d::Identity();
     Q.block<6,6>(6,6) = 20.0 * Eigen::Matrix<double,6,6>::Identity();
 
     R.setZero();
@@ -148,9 +151,17 @@ public:
       const DesiredState13& xd0,
       Eigen::Matrix<double,7,1>* tau_cmd);
 
+  void enableLogging(bool on) { log_enabled_ = on; }
+  void setLogDecimation(int d) { log_decim_ = std::max(1, d); }
+
 
 private:
   std::unique_ptr<DualLayerGMPC> impl_;
+  // ===== logging =====
+  bool log_enabled_{true};
+  int  log_decim_{5};              // 每5次记录一次（1kHz -> 200Hz）
+  int  log_counter_{0};
+  CSVLogger logger_;
 };
 
 } // namespace serl_franka_controllers

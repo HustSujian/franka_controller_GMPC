@@ -14,6 +14,10 @@
 
 #include "serl_franka_controllers/gmpc_dual_layer.h"
 #include <OsqpEigen/OsqpEigen.h>
+#include <serl_franka_controllers/csv_logger.h>
+#include <ros/package.h>
+#include <ros/time.h>
+
 #include <ros/ros.h>
 #include <chrono>
 
@@ -33,7 +37,7 @@
 #include <vector>
 
 #include <unsupported/Eigen/MatrixFunctions>
-#include <franka_hw/franka_model_interface.h> 
+
 
 
 namespace serl_franka_controllers
@@ -305,11 +309,11 @@ namespace serl_franka_controllers
     const double radius = 0.4;
     const double height = 0.2;
     const double turns  = 0.6;
-    const double t_end  = 30.0;
+    const double t_end  = 10.0;
 
     const double x = radius * std::cos(2 * M_PI * turns * t / t_end);
     const double y = radius * std::sin(2 * M_PI * turns * t / t_end);
-    const double z = 0.9 + height * t / t_end;
+    const double z = 0.6 + height * t / t_end;
 
     const double x_d = -radius * (2 * M_PI * turns) / t_end * std::sin(2 * M_PI * turns * t / t_end);
     const double y_d =  radius * (2 * M_PI * turns) / t_end * std::cos(2 * M_PI * turns * t / t_end);
@@ -426,6 +430,33 @@ namespace serl_franka_controllers
       Eigen::Matrix<double, 12, 1> p0;
       p0 << phi, V_cur;
       // p0 << phi, V_body;   //这个修复在 “in.J 是 spatial Jacobian（基座/世界系表达）” 的前提下是正确的
+
+      // ===================== CSV logging init + log p0/Vd =====================
+      static serl_franka_controllers::CSVLogger s_logger;
+      static bool s_logger_inited = false;
+      static int  s_cnt = 0;
+      static const int s_decim = 1; // 每5次记录一次（1kHz->200Hz）
+
+      if (!s_logger_inited) {
+        const std::string pkg_path = ros::package::getPath("serl_franka_controllers");
+        const std::string log_path = pkg_path + "/logs/gmpc_log.csv";
+
+        const std::string header =
+          "t,"
+          // p0 = [phi(6), V_cur(6)]
+          "phi1,phi2,phi3,phi4,phi5,phi6,"
+          "w1,w2,w3,v1,v2,v3,"
+          // Vd
+          "vd_w1,vd_w2,vd_w3,vd_v1,vd_v2,vd_v3,"
+          // u_primary
+          "upri1,upri2,upri3,upri4,upri5,upri6,upri7,"
+          // u_final
+          "ufin1,ufin2,ufin3,ufin4,ufin5,ufin6,ufin7";
+
+
+        s_logger.open(log_path, header);
+        s_logger_inited = true;
+      }
 
       // ROS_INFO_THROTTLE(0.1, "V_spatial norm=%.3f, V_body norm=%.3f", V_spatial.norm(), V_body.norm()); // 比较空间/body旋量
 
@@ -548,6 +579,23 @@ namespace serl_franka_controllers
 
       last_u_cmd_ = u_final;
       last_u_prev_valid_ = true;
+
+     if ((s_cnt++ % s_decim) == 0) {
+        static double t0 = -1.0;
+        double t = ros::WallTime::now().toSec();
+        if (t0 < 0.0) t0 = t;
+        double t_rel = t - t0;
+
+        const Eigen::Matrix<double,6,1> Vd = in.Vd;
+
+        s_logger.log_primary_final(
+            t,
+            p0,
+            Vd,
+            u_primary,
+            u_final);
+      }
+
       return u_final;
     }
 
@@ -809,7 +857,7 @@ namespace serl_franka_controllers
 
       const Eigen::Matrix<double, 6, 1> b_aff = -J * (Minv * in.gravity);
 
-      Eigen::Matrix<double, 6, 6> H = J * (Minv * (in.M * J_pinv * dot * J_pinv - Cmat * J_pinv));
+      Eigen::Matrix<double, 6, 6> H = J * (Minv * (in.M * J_pinv * Jdot * J_pinv - Cmat * J_pinv));
 
       // 常量矩阵
       const Eigen::Matrix<double, 6, 6> I6 = Eigen::Matrix<double, 6, 6>::Identity();
@@ -1179,11 +1227,11 @@ namespace serl_franka_controllers
       if (!primary_initialized_)
       {
         // 参考 Jacobian.cpp 中验证有效的求解器设置
-        primary_solver_.settings()->setVerbosity(true);
+        primary_solver_.settings()->setVerbosity(false);
         primary_solver_.settings()->setWarmStart(true);
         primary_solver_.settings()->setMaxIteration(5000);
-        primary_solver_.settings()->setAbsoluteTolerance(1e-6);
-        primary_solver_.settings()->setRelativeTolerance(1e-5);
+        // primary_solver_.settings()->setAbsoluteTolerance(1e-4);
+        primary_solver_.settings()->setRelativeTolerance(1e-4);
         primary_solver_.settings()->setAdaptiveRho(true);
         primary_solver_.settings()->setPolish(true);
 
@@ -1282,8 +1330,8 @@ namespace serl_franka_controllers
         secondary_solver_.settings()->setVerbosity(false);
         secondary_solver_.settings()->setWarmStart(true);
         secondary_solver_.settings()->setMaxIteration(3000);
-        secondary_solver_.settings()->setAbsoluteTolerance(1e-6);
-        secondary_solver_.settings()->setRelativeTolerance(1e-5);
+       // secondary_solver_.settings()->setAbsoluteTolerance(1e-6);
+        secondary_solver_.settings()->setRelativeTolerance(1e-4);
         secondary_solver_.settings()->setAdaptiveRho(true);
         secondary_solver_.settings()->setPolish(true);
 
@@ -1401,6 +1449,20 @@ namespace serl_franka_controllers
 GMPCDualLayer::GMPCDualLayer()
 {
   impl_ = std::make_unique<DualLayerGMPC>();
+
+  const std::string pkg_path = ros::package::getPath("serl_franka_controllers");
+  const std::string log_path = pkg_path + "/logs/gmpc_log.csv";
+
+  // 确保 logs 目录存在（最简单：让你自己手动建一次目录，见后面）
+  const std::string header =
+    "t,"
+    "phi1,phi2,phi3,phi4,phi5,phi6,"
+    "w1,w2,w3,v1,v2,v3,"
+    "vd_w1,vd_w2,vd_w3,vd_v1,vd_v2,vd_v3,"
+    "tau1,tau2,tau3,tau4,tau5,tau6,tau7";
+
+  logger_.open(log_path, header);
+
 }
 
 GMPCDualLayer::~GMPCDualLayer() = default;
@@ -1440,7 +1502,7 @@ bool GMPCDualLayer::computeTauMPC(
     const Eigen::Matrix<double, 7, 7> &M,
     const Eigen::Matrix<double, 7, 1> &C,
     const Eigen::Matrix<double, 7, 1> &G,
-    const franka_hw::FrankaModelHandle& model_handle,
+    const franka_hw::FrankaModelHandle& model_handle_,
     const franka::RobotState& robot_state,
     const DesiredState13 &xd0,
     Eigen::Matrix<double, 7, 1> *tau_cmd)
