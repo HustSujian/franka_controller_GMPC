@@ -157,7 +157,7 @@ void CartesianImpedanceController::update(const ros::Time& time,
   Eigen::Map<Eigen::Matrix<double, 6, 7>> jacobian_raw(jacobian_array.data());
   
   // 雅可比矩阵顺序调整：Franka原始顺序为[线速度3行; 角速度3行]
-  // GMPC需要的顺序：[角速度3行; 线速度3行]（与Jacobian.cpp一致）
+  // GMPC需要的顺序：[角速度3行; 线速度3行]
   Eigen::Matrix<double, 6, 7> jacobian;
   jacobian.block<3, 7>(0, 0) = jacobian_raw.block<3, 7>(3, 0);  // 角速度放到前3行
   jacobian.block<3, 7>(3, 0) = jacobian_raw.block<3, 7>(0, 0);  // 线速度放到后3行
@@ -271,10 +271,10 @@ void CartesianImpedanceController::update(const ros::Time& time,
     xd0.v(5) = position_d_(1);
     xd0.v(6) = position_d_(2);
     // 1) 期望姿态（四元数：w x y z）
-    // xd0.v(0) = 1.0;
-    // xd0.v(1) = 0.0;
-    // xd0.v(2) = 0.0;
-    // xd0.v(3) = 0.0;
+    xd0.v(0) = 1.0;
+    xd0.v(1) = 0.0;
+    xd0.v(2) = 0.0;
+    xd0.v(3) = 0.0;
 
     ROS_INFO_THROTTLE(0.1,
     "[GMPC][Fixed] qd (wxyz) = [%.6f %.6f %.6f %.6f]",
@@ -314,7 +314,7 @@ void CartesianImpedanceController::update(const ros::Time& time,
   if (!ok)
   {
     // GMPC求解失败，降级到原阻抗控制器
-    ROS_WARN_THROTTLE(1.0, "GMPC solver failed, using fallback impedance control");
+    ROS_WARN_THROTTLE(0.1, "GMPC solver failed, using fallback impedance control");
     tau_d_cmd = tau_task + tau_nullspace + coriolis;
   }
   else

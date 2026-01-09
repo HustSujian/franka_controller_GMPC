@@ -233,7 +233,6 @@ namespace serl_franka_controllers
   }
 
 
-
   // 位姿转齐次变换矩阵：将四元数和位置组合为4x4变换矩阵
   // 输入：q=四元数姿态, p=3维位置向量
   // 输出：4x4齐次变换矩阵T，左上3x3为旋转矩阵，右上3x1为平移向量
@@ -320,7 +319,7 @@ namespace serl_franka_controllers
     const double z_d =  height / t_end;
 
     // Eigen::Vector4d q0(0.6, 0, 0, 0.8);
-    Eigen::Vector4d q0(1, 0, 0, 0);
+    Eigen::Vector4d q0(0, 1, 0, 0);
     q0.normalize();
 
     xd0->v(0)=q0(0); xd0->v(1)=q0(1); xd0->v(2)=q0(2); xd0->v(3)=q0(3);
@@ -589,7 +588,7 @@ namespace serl_franka_controllers
         const Eigen::Matrix<double,6,1> Vd = in.Vd;
 
         s_logger.log_primary_final(
-            t,
+            t_rel,
             p0,
             Vd,
             u_primary,
@@ -1453,13 +1452,18 @@ GMPCDualLayer::GMPCDualLayer()
   const std::string pkg_path = ros::package::getPath("serl_franka_controllers");
   const std::string log_path = pkg_path + "/logs/gmpc_log.csv";
 
-  // 确保 logs 目录存在（最简单：让你自己手动建一次目录，见后面）
+  // 确保 logs 目录存在
   const std::string header =
-    "t,"
-    "phi1,phi2,phi3,phi4,phi5,phi6,"
-    "w1,w2,w3,v1,v2,v3,"
-    "vd_w1,vd_w2,vd_w3,vd_v1,vd_v2,vd_v3,"
-    "tau1,tau2,tau3,tau4,tau5,tau6,tau7";
+          "t,"
+          // p0 = [phi(6), V_cur(6)]
+          "phi1,phi2,phi3,phi4,phi5,phi6,"
+          "w1,w2,w3,v1,v2,v3,"
+          // Vd
+          "vd_w1,vd_w2,vd_w3,vd_v1,vd_v2,vd_v3,"
+          // u_primary
+          "upri1,upri2,upri3,upri4,upri5,upri6,upri7,"
+          // u_final
+          "ufin1,ufin2,ufin3,ufin4,ufin5,ufin6,ufin7";
 
   logger_.open(log_path, header);
 

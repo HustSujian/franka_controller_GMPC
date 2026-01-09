@@ -90,14 +90,26 @@ struct GMPCParams
     Q.block<3,3>(3,3) = 150.0 * Eigen::Matrix3d::Identity();
     Q.block<6,6>(6,6) = 20.0 * Eigen::Matrix<double,6,6>::Identity();
 
+    Eigen::Matrix<double,12,1> Qdiag;
+    Qdiag <<
+        20,20,20,
+        2200,2200,2250,
+        2,2,2,
+        5,5,10;
+
+    Q = Qdiag.asDiagonal();
+
     R.setZero();
-    R.diagonal().setConstant(1e-6);
+    R.diagonal().setConstant(1e-3);
+    // Eigen::Matrix<double,7,1> Rdiag;
+    // Rdiag << 4e-3, 1e-3, 10e-3, 5e-3, 10e-3, 1e-3, 1e-3;
+    // R = Rdiag.asDiagonal();
 
     P = 10.0 * Q;
 
     // null 权重（按你之前那组）
     R_null.setZero();
-    // R_null.diagonal() << 0.1, 1.0, 1.0, 1.0, 0.1, 0.1, 0.1;
+  //  R_null.diagonal() << 0.1, 1.0, 1.0, 1.0, 0.1, 0.1, 0.1;
 
     // Franka 关节力矩安全范围
     umax << 87, 87, 87, 87, 12, 12, 12;
@@ -159,7 +171,7 @@ private:
   std::unique_ptr<DualLayerGMPC> impl_;
   // ===== logging =====
   bool log_enabled_{true};
-  int  log_decim_{5};              // 每5次记录一次（1kHz -> 200Hz）
+  int  log_decim_{1};              // 每5次记录一次（1kHz -> 200Hz）
   int  log_counter_{0};
   CSVLogger logger_;
 };
