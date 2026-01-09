@@ -11,12 +11,13 @@
 //
 // 注（Franka 实际应用）：
 // - Franka 通过 model handle 提供质量矩阵 M(q)、科里奥利向量 c(q,dq) 与重力 g(q)。
-// - 不提供科里奥利矩阵 C(q,dq)，Jdot 也无法直接获取。
-// - 因此采用仿射的 Vdot 模型：
-//     Vdot = J * M^{-1} * u  +  (Jdot*dq - J*M^{-1}(coriolis+gravity))
-//   并用有限差分估计 Jdot。
+
 #include "serl_franka_controllers/gmpc_dual_layer.h"
 #include <OsqpEigen/OsqpEigen.h>
+#include <serl_franka_controllers/csv_logger.h>
+#include <ros/package.h>
+#include <ros/time.h>
+
 #include <ros/ros.h>
 #include <chrono>
 
@@ -36,6 +37,8 @@
 #include <vector>
 
 #include <unsupported/Eigen/MatrixFunctions>
+
+
 
 namespace serl_franka_controllers
 {
@@ -161,6 +164,76 @@ namespace serl_franka_controllers
     return phi;
   }
 
+  static inline Eigen::Matrix<double,6,6> adjointSE3(const Eigen::Matrix4d& T)
+  {
+    Eigen::Matrix<double,6,6> Ad = Eigen::Matrix<double,6,6>::Zero();
+    Eigen::Matrix3d R = T.block<3,3>(0,0);
+    Eigen::Vector3d p = T.block<3,1>(0,3);
+
+    Eigen::Matrix3d p_hat;
+    p_hat <<   0,   -p.z(),  p.y(),
+            p.z(),     0,   -p.x(),
+          -p.y(),  p.x(),     0;
+
+    // V = [w; v] 约定下：Ad = [[R,0],[p_hat*R, R]]
+    Ad.block<3,3>(0,0) = R;
+    Ad.block<3,3>(3,3) = R;
+    Ad.block<3,3>(3,0) = p_hat * R;
+    return Ad;
+  }
+
+
+  static inline Eigen::Matrix<double,7,7> CoriolisMatrixFromFranka(
+      const franka_hw::FrankaModelHandle& model,
+      const franka::RobotState& rs,
+      const Eigen::Matrix<double,7,1>& q,
+      const Eigen::Matrix<double,7,1>& qd)
+  {
+    constexpr int N = 7;
+    Eigen::Matrix<double,N,N> Cmat = Eigen::Matrix<double,N,N>::Zero();
+    Eigen::Matrix<double,N,N> Csq  = Eigen::Matrix<double,N,N>::Zero();
+
+    auto coriolis_vec = [&](const Eigen::Matrix<double,N,1>& dq_test) -> Eigen::Matrix<double,N,1> {
+      std::array<double,7> q_arr{}, dq_arr{};
+      for (int i = 0; i < N; ++i) { q_arr[i] = q(i); dq_arr[i] = dq_test(i); }
+
+      const std::array<double,7> c_arr =
+          model.getCoriolis(q_arr, dq_arr, rs.I_total, rs.m_total, rs.F_x_Ctotal);
+
+      Eigen::Matrix<double,N,1> c;
+      for (int i = 0; i < N; ++i) c(i) = c_arr[i];
+      return c;
+    };
+
+    // 1) Csq(:,j) = c(q, e_j)
+    for (int j = 0; j < N; ++j) {
+      Eigen::Matrix<double,N,1> dq_test = Eigen::Matrix<double,N,1>::Zero();
+      dq_test(j) = 1.0;
+      Csq.col(j) = coriolis_vec(dq_test);
+    }
+
+    // 2) cross terms via c(q, e_j + e_k)
+    for (int j = 0; j < N; ++j) {
+      for (int k = j + 1; k < N; ++k) {
+        Eigen::Matrix<double,N,1> dq_test = Eigen::Matrix<double,N,1>::Zero();
+        dq_test(j) = 1.0;
+        dq_test(k) = 1.0;
+
+        const Eigen::Matrix<double,N,1> tau   = coriolis_vec(dq_test);
+        const Eigen::Matrix<double,N,1> cross = (tau - Csq.col(k) - Csq.col(j));
+
+        Cmat.col(k) += cross * (qd(j) / 2.0);
+        Cmat.col(j) += cross * (qd(k) / 2.0);
+      }
+    }
+
+    // 3) add centrifugal term
+    Cmat += Csq * qd.asDiagonal();
+    return Cmat;
+  }
+
+
+
   // 位姿转齐次变换矩阵：将四元数和位置组合为4x4变换矩阵
   // 输入：q=四元数姿态, p=3维位置向量
   // 输出：4x4齐次变换矩阵T，左上3x3为旋转矩阵，右上3x1为平移向量
@@ -236,11 +309,11 @@ namespace serl_franka_controllers
     const double radius = 0.4;
     const double height = 0.2;
     const double turns  = 0.6;
-    const double t_end  = 30.0;
+    const double t_end  = 10.0;
 
     const double x = radius * std::cos(2 * M_PI * turns * t / t_end);
     const double y = radius * std::sin(2 * M_PI * turns * t / t_end);
-    const double z = 0.9 + height * t / t_end;
+    const double z = 0.6 + height * t / t_end;
 
     const double x_d = -radius * (2 * M_PI * turns) / t_end * std::sin(2 * M_PI * turns * t / t_end);
     const double y_d =  radius * (2 * M_PI * turns) / t_end * std::cos(2 * M_PI * turns * t / t_end);
@@ -255,8 +328,6 @@ namespace serl_franka_controllers
     xd0->v(7)=0; xd0->v(8)=0; xd0->v(9)=0;
     xd0->v(10)=x_d; xd0->v(11)=y_d; xd0->v(12)=z_d;
   }
-
-
 
   // ------------------------------ 输入结构体 ------------------------------
 
@@ -284,6 +355,9 @@ namespace serl_franka_controllers
 
     // 基座系雅可比及可选的 Jdot 估计
     Eigen::Matrix<double, 6, 7> J;
+
+    Eigen::Matrix<double, 7, 7> Cmat = Eigen::Matrix<double,7,7>::Zero();
+    Eigen::Matrix<double, 6, 7> Jdot = Eigen::Matrix<double,6,7>::Zero();
   };
 
   // ------------------------------ 双层 GMPC 求解器 ------------------------------
@@ -351,9 +425,40 @@ namespace serl_franka_controllers
 
       const Eigen::Matrix<double, 6, 1> phi = se3LogPhi(T_err);
       const Eigen::Matrix<double, 6, 1> V_cur = in.J * in.dq;
+      // const Eigen::Matrix<double, 6, 1> V_body = adjointSE3(T_cur.inverse()) * V_spatial;  // 换成body雅可比就不用这一步
 
       Eigen::Matrix<double, 12, 1> p0;
       p0 << phi, V_cur;
+      // p0 << phi, V_body;   //这个修复在 “in.J 是 spatial Jacobian（基座/世界系表达）” 的前提下是正确的
+
+      // ===================== CSV logging init + log p0/Vd =====================
+      static serl_franka_controllers::CSVLogger s_logger;
+      static bool s_logger_inited = false;
+      static int  s_cnt = 0;
+      static const int s_decim = 1; // 每5次记录一次（1kHz->200Hz）
+
+      if (!s_logger_inited) {
+        const std::string pkg_path = ros::package::getPath("serl_franka_controllers");
+        const std::string log_path = pkg_path + "/logs/gmpc_log.csv";
+
+        const std::string header =
+          "t,"
+          // p0 = [phi(6), V_cur(6)]
+          "phi1,phi2,phi3,phi4,phi5,phi6,"
+          "w1,w2,w3,v1,v2,v3,"
+          // Vd
+          "vd_w1,vd_w2,vd_w3,vd_v1,vd_v2,vd_v3,"
+          // u_primary
+          "upri1,upri2,upri3,upri4,upri5,upri6,upri7,"
+          // u_final
+          "ufin1,ufin2,ufin3,ufin4,ufin5,ufin6,ufin7";
+
+
+        s_logger.open(log_path, header);
+        s_logger_inited = true;
+      }
+
+      // ROS_INFO_THROTTLE(0.1, "V_spatial norm=%.3f, V_body norm=%.3f", V_spatial.norm(), V_body.norm()); // 比较空间/body旋量
 
       ROS_INFO_THROTTLE(0.1,
       "GMPC p0 | phi=[%.3f %.3f %.3f %.3f %.3f %.3f] | V=[%.3f %.3f %.3f %.3f %.3f %.3f]",
@@ -362,8 +467,9 @@ namespace serl_franka_controllers
 
       // 预测时域的期望 twist 轨迹：沿用 MATLAB xid(k,:) = 期望 twist 样本
       std::vector<Eigen::Matrix<double, 6, 1>> Vd_seq(params_.Nt);
-      for (int k = 0; k < params_.Nt; ++k)
+      for (int k = 0; k < params_.Nt; ++k){
         Vd_seq[k] = in.Vd;
+      }
 
       // ----------- 自适应阻尼与零空间投影 N -----------
       const double condJ = condNumber(in.J);
@@ -399,7 +505,7 @@ namespace serl_franka_controllers
         status1 = solveOSQPPrimary(qp1, &sol1_x);
         auto t1 = std::chrono::steady_clock::now();
         double ms = 1e3 * std::chrono::duration<double>(t1 - t0).count();
-        ROS_WARN_THROTTLE(1.0, "OSQP primary solve wall-time: %.3f ms", ms);
+        ROS_WARN_THROTTLE(0.1, "OSQP primary solve wall-time: %.3f ms", ms);
 
         if (status1 == 1 && sol1_x.size() == qp1.nvar)
         {
@@ -473,6 +579,23 @@ namespace serl_franka_controllers
 
       last_u_cmd_ = u_final;
       last_u_prev_valid_ = true;
+
+     if ((s_cnt++ % s_decim) == 0) {
+        static double t0 = -1.0;
+        double t = ros::WallTime::now().toSec();
+        if (t0 < 0.0) t0 = t;
+        double t_rel = t - t0;
+
+        const Eigen::Matrix<double,6,1> Vd = in.Vd;
+
+        s_logger.log_primary_final(
+            t,
+            p0,
+            Vd,
+            u_primary,
+            u_final);
+      }
+
       return u_final;
     }
 
@@ -564,7 +687,7 @@ namespace serl_franka_controllers
       qp.nvar = nvar;
       qp.ncon = ncon;
 
-      // --------- 组装 H 与 g（代价） ---------
+      // --------- 组装 H 与 g（代价函数） ---------
       // 参考 Jacobian.cpp 验证过的成本函数构建方式：
       // 对 k=1..Nt:
       //   C = I; C(7:12,1:6) = -ad(Vd_k)
@@ -580,7 +703,7 @@ namespace serl_franka_controllers
 
       for (int k = 1; k <= Nt; ++k)
       {
-        // 构造C矩阵（参考Jacobian.cpp中验证的方式）
+        // 构造C矩阵
         Eigen::Matrix<double, 12, 12> Cmap = Eigen::Matrix<double, 12, 12>::Identity();
         Cmap.block<6, 6>(6, 0) = -ad6(Vd_seq[std::min(k - 1, Nt - 1)]);
 
@@ -608,7 +731,7 @@ namespace serl_franka_controllers
         qp.g.segment(idx0, Nx) += gblk;
       }
 
-      // 控制代价：U 序列上块对角的 R（参考Jacobian.cpp）
+      // 控制代价：U 序列上块对角的 R
       const int u_offset = Nx * (Nt + 1);
       for (int k = 0; k < Nt; ++k)
       {
@@ -716,17 +839,25 @@ namespace serl_franka_controllers
       //  Ad = I + Ac*dt
       //  Bd = Bc*dt
       //  hd = hc*dt
-      //
+
       const Eigen::Matrix<double, 7, 7> Minv = in.M.inverse();
       const Eigen::Matrix<double, 6, 7> J = in.J;
       const Eigen::Matrix<double, 6, 7> Jdot = estimateJdot(in.J, dt);
+      const Eigen::Matrix<double, 7, 6> J_pinv = pseudoInvJ(J);
+      const Eigen::Matrix<double, 7, 7> C = in.Cmat;
+
+      Eigen::Matrix<double, 7, 7> Cmat = Eigen::Matrix<double, 7, 7>::Zero();
+      double eps = 1e-3;
+      for (int i = 0; i < 7; ++i)
+      {
+        Cmat(i, i) = in.coriolis(i) * in.dq(i) / (in.dq(i) * in.dq(i) + eps * eps);
+      }
 
       const Eigen::Matrix<double, 6, 7> F = J * Minv; // J*M^{-1}
 
-      // b_aff = Jdot*dq - J*M^{-1}*(coriolis+gravity)
+      const Eigen::Matrix<double, 6, 1> b_aff = -J * (Minv * in.gravity);
 
-      const Eigen::Matrix<double, 7, 1> tau_bias = in.coriolis + in.gravity;
-      const Eigen::Matrix<double, 6, 1> b_aff = (Jdot * in.dq) - (J * (Minv * tau_bias));
+      Eigen::Matrix<double, 6, 6> H = J * (Minv * (in.M * J_pinv * Jdot * J_pinv - Cmat * J_pinv));
 
       // 常量矩阵
       const Eigen::Matrix<double, 6, 6> I6 = Eigen::Matrix<double, 6, 6>::Identity();
@@ -736,12 +867,11 @@ namespace serl_franka_controllers
       {
         const Eigen::Matrix<double, 6, 1> Vd = Vd_seq[k];
 
-        // 连续时间动力学矩阵（参考Jacobian.cpp）
+        // 连续时间动力学矩阵
         Eigen::Matrix<double, 12, 12> Ac = Eigen::Matrix<double, 12, 12>::Zero();
         Ac.block<6, 6>(0, 0) = -ad6(Vd);
         Ac.block<6, 6>(0, 6) = -I6;
-        // V的动力学：H矩阵（这里简化，可扩展加入更复杂的耦合）
-        // Ac.block<6,6>(6,6) = H; // 如需要可添加
+        Ac.block<6,6>(6,6) = H; 
 
         Eigen::Matrix<double, 12, 7> Bc = Eigen::Matrix<double, 12, 7>::Zero();
         Bc.block<6, 7>(6, 0) = F; // 只有V部分受控制输入影响
@@ -1097,11 +1227,11 @@ namespace serl_franka_controllers
       if (!primary_initialized_)
       {
         // 参考 Jacobian.cpp 中验证有效的求解器设置
-        primary_solver_.settings()->setVerbosity(true);
+        primary_solver_.settings()->setVerbosity(false);
         primary_solver_.settings()->setWarmStart(true);
         primary_solver_.settings()->setMaxIteration(5000);
-        primary_solver_.settings()->setAbsoluteTolerance(1e-6);
-        primary_solver_.settings()->setRelativeTolerance(1e-5);
+        // primary_solver_.settings()->setAbsoluteTolerance(1e-4);
+        primary_solver_.settings()->setRelativeTolerance(1e-4);
         primary_solver_.settings()->setAdaptiveRho(true);
         primary_solver_.settings()->setPolish(true);
 
@@ -1200,8 +1330,8 @@ namespace serl_franka_controllers
         secondary_solver_.settings()->setVerbosity(false);
         secondary_solver_.settings()->setWarmStart(true);
         secondary_solver_.settings()->setMaxIteration(3000);
-        secondary_solver_.settings()->setAbsoluteTolerance(1e-6);
-        secondary_solver_.settings()->setRelativeTolerance(1e-5);
+       // secondary_solver_.settings()->setAbsoluteTolerance(1e-6);
+        secondary_solver_.settings()->setRelativeTolerance(1e-4);
         secondary_solver_.settings()->setAdaptiveRho(true);
         secondary_solver_.settings()->setPolish(true);
 
@@ -1319,6 +1449,20 @@ namespace serl_franka_controllers
 GMPCDualLayer::GMPCDualLayer()
 {
   impl_ = std::make_unique<DualLayerGMPC>();
+
+  const std::string pkg_path = ros::package::getPath("serl_franka_controllers");
+  const std::string log_path = pkg_path + "/logs/gmpc_log.csv";
+
+  // 确保 logs 目录存在（最简单：让你自己手动建一次目录，见后面）
+  const std::string header =
+    "t,"
+    "phi1,phi2,phi3,phi4,phi5,phi6,"
+    "w1,w2,w3,v1,v2,v3,"
+    "vd_w1,vd_w2,vd_w3,vd_v1,vd_v2,vd_v3,"
+    "tau1,tau2,tau3,tau4,tau5,tau6,tau7";
+
+  logger_.open(log_path, header);
+
 }
 
 GMPCDualLayer::~GMPCDualLayer() = default;
@@ -1358,6 +1502,8 @@ bool GMPCDualLayer::computeTauMPC(
     const Eigen::Matrix<double, 7, 7> &M,
     const Eigen::Matrix<double, 7, 1> &C,
     const Eigen::Matrix<double, 7, 1> &G,
+    const franka_hw::FrankaModelHandle& model_handle_,
+    const franka::RobotState& robot_state,
     const DesiredState13 &xd0,
     Eigen::Matrix<double, 7, 1> *tau_cmd)
 {
@@ -1392,6 +1538,13 @@ bool GMPCDualLayer::computeTauMPC(
   in.coriolis = C;
   in.gravity = G;
   in.J = J;
+  in.Jdot = Jdot;
+
+  in.Cmat = CoriolisMatrixFromFranka(model_handle_, robot_state, q, dq);
+  const Eigen::Matrix<double,7,1> c_check = in.Cmat * in.dq;
+  if ((c_check - in.coriolis).norm() > 1e-3) {
+    // 打印一下，看看是否一致
+  }
 
   try
   {

@@ -46,7 +46,7 @@ class CartesianImpedanceController : public controller_interface::MultiInterface
   std::vector<hardware_interface::JointHandle> joint_handles_;
   std::array<double, 42> jacobian_array;
 
-    // ===== GMPC dual-layer solver =====
+  // ===== GMPC dual-layer solver =====
   serl_franka_controllers::GMPCDualLayer gmpc_;
   serl_franka_controllers::GMPCParams gmpc_params_;
 
@@ -55,8 +55,8 @@ class CartesianImpedanceController : public controller_interface::MultiInterface
   bool J_prev_valid_ = false;
 
   // 轨迹生成参数
-  double t_total_ = 20.0;           // 总运行时间
-  bool use_trajectory_ = false;    // 是否使用轨迹跟踪（false=固定点）
+  double t_total_ = 10.0;           // 总运行时间
+  bool use_trajectory_ = true;    // 是否使用轨迹跟踪（false=固定点）
 
 
   double filter_params_{0.005};

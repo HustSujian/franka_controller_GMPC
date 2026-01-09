@@ -19,8 +19,6 @@ Reference:
 #include <serl_franka_controllers/gmpc_dual_layer.h>
 
 
-
-
 namespace serl_franka_controllers {
 
 bool CartesianImpedanceController::init(hardware_interface::RobotHW* robot_hw,
@@ -126,7 +124,7 @@ void CartesianImpedanceController::starting(const ros::Time& /*time*/) {
   franka::RobotState initial_state = state_handle_->getRobotState();
   // get jacobian
   std::array<double, 42> jacobian_array =
-      model_handle_->getZeroJacobian(franka::Frame::kEndEffector);
+      model_handle_->getBodyJacobian(franka::Frame::kEndEffector);
   // convert to eigen
   Eigen::Map<Eigen::Matrix<double, 7, 1>> q_initial(initial_state.q.data());
   Eigen::Affine3d initial_transform(Eigen::Matrix4d::Map(initial_state.O_T_EE.data()));
@@ -153,7 +151,7 @@ void CartesianImpedanceController::update(const ros::Time& time,
   franka::RobotState robot_state = state_handle_->getRobotState();
   std::array<double, 7> coriolis_array = model_handle_->getCoriolis();
   jacobian_array =
-      model_handle_->getZeroJacobian(franka::Frame::kEndEffector);
+      model_handle_->getBodyJacobian(franka::Frame::kEndEffector);
   publishZeroJacobian(time);
   Eigen::Map<Eigen::Matrix<double, 7, 1>> coriolis(coriolis_array.data());
   Eigen::Map<Eigen::Matrix<double, 6, 7>> jacobian_raw(jacobian_array.data());
@@ -288,8 +286,8 @@ void CartesianImpedanceController::update(const ros::Time& time,
 
     // // 2) 期望位置（单位 m）
     xd0.v(4) = 0.3;
-    xd0.v(5) = 0.0;
-    xd0.v(6) = 0.6;
+    xd0.v(5) = 0.2;
+    xd0.v(6) = 0.8;
     // xd0.v(7..12) = 0 (已经通过 setZero() 设置)
     ROS_INFO_THROTTLE(3.0, "Fixed trajectory mode");
   }
@@ -305,8 +303,9 @@ void CartesianImpedanceController::update(const ros::Time& time,
       jacobian,     // 雅可比矩阵
       Jdot,         // 雅可比导数
       M,            // 质量矩阵
-      coriolis,     // 科氏力+重力（Franka的coriolis已包含重力）
-      G,            // 重力向量（单独传递用于GMPC内部计算）
+      coriolis,     // 科氏力
+      G,            // 重力向量
+      *model_handle_, robot_state, 
       xd0,          // 期望状态
       &tau_u);      // 输出：控制力矩（不含补偿项）
 
